@@ -2,6 +2,8 @@ from django.db import connection
 from rest_framework import viewsets, permissions, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
+from rest_framework.views import APIView
+import uuid
 
 from .supabase_models import (
     SbCompany,
@@ -25,6 +27,10 @@ from .supabase_serializers import (
     ApplicationSerializer,
     RecommendationSerializer,
 )
+from .rag import embed_text, search_similar_jobs, generate_answer, chunk_text
+from decouple import config
+
+EMB_DIM = config("FIREWORKS_EMBEDDING_DIM", default=None, cast=int)
 
 
 class CompanyViewSet(viewsets.ModelViewSet):
@@ -61,6 +67,33 @@ class JobViewSet(viewsets.ModelViewSet):
     queryset = Job.objects.all()
     serializer_class = JobSerializer
     permission_classes = [permissions.IsAuthenticated]
+
+    def create(self, request, *args, **kwargs):
+        response = super().create(request, *args, **kwargs)
+        if response.status_code == status.HTTP_201_CREATED:
+            job_id = response.data.get("id")
+            title = response.data.get("title")
+            description = response.data.get("description")
+            requirements = response.data.get("requirements")
+            text = f"{title}\n{description or ''}\n{requirements or ''}".strip()
+            
+            chunks = chunk_text(text)
+            
+            for i, chunk in enumerate(chunks or []):
+                try:
+                    emb = embed_text(chunk)
+                    
+                    if EMB_DIM and len(emb) != EMB_DIM:
+                        continue
+                        
+                    with connection.cursor() as c:
+                        c.execute(
+                            "INSERT INTO job_embeddings (id, job_id, created_at, embedding) VALUES (%s, %s, NOW(), %s::vector)",
+                            [str(uuid.uuid4()), str(job_id), emb],
+                        )
+                except Exception as e:
+                    continue
+        return response
 
     @action(detail=True, methods=["post"], url_path="skills")
     def add_skill(self, request, pk=None):
@@ -104,4 +137,45 @@ class ApplicationViewSet(viewsets.ModelViewSet):
 class RecommendationViewSet(viewsets.ReadOnlyModelViewSet):
     queryset = Recommendation.objects.all()
     serializer_class = RecommendationSerializer
-    permission_classes = [permissions.IsAuthenticated] 
+    permission_classes = [permissions.IsAuthenticated]
+
+
+class RAGSearchView(APIView):
+    permission_classes = [permissions.AllowAny]
+
+    def post(self, request):
+        query = request.data.get("query")
+        top_n = int(request.data.get("top_n", 5))
+        similarity_threshold = float(request.data.get("similarity_threshold", 0.3))
+        
+        if not query:
+            return Response({"detail": "query is required"}, status=400)
+        
+        try:
+            q_emb = embed_text(query)
+            rows = search_similar_jobs(q_emb, top_n=top_n, similarity_threshold=similarity_threshold)
+            
+            jobs = [
+                {
+                    "id": str(row[0]),
+                    "title": row[1],
+                    "description": row[2],
+                    "requirements": row[3],
+                    "company": str(row[4]),
+                    "score": float(row[6]),
+                }
+                for row in rows
+            ]
+            
+            summary = generate_answer(query, rows)
+            
+            return Response({
+                "query": query, 
+                "results": jobs, 
+                "summary": summary,
+                "total_matches": len(jobs),
+                "similarity_threshold": similarity_threshold
+            }, status=200)
+            
+        except Exception as e:
+            return Response({"detail": str(e)}, status=400) 

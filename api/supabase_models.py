@@ -1,5 +1,6 @@
 import uuid
 from django.db import models
+from django.conf import settings
 
 
 class SbCompany(models.Model):
@@ -65,7 +66,12 @@ class CVEmbedding(models.Model):
 
 class Job(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    company = models.ForeignKey(SbCompany, models.DO_NOTHING, db_column="company_id")
+    company = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        models.DO_NOTHING,
+        db_column="company_id",
+        related_name="company_jobs",
+    )
     title = models.TextField()
     description = models.TextField(blank=True, null=True)
     requirements = models.TextField(blank=True, null=True)

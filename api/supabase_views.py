@@ -66,7 +66,17 @@ class CVEmbeddingViewSet(viewsets.ReadOnlyModelViewSet):
 class JobViewSet(viewsets.ModelViewSet):
     queryset = Job.objects.all()
     serializer_class = JobSerializer
-    permission_classes = [permissions.IsAuthenticated]
+    permission_classes = [permissions.AllowAny]
+
+    @action(detail=False, methods=["get"], url_path=r"by-company/(?P<company_id>\d+)")
+    def by_company(self, request, company_id=None):
+        queryset = self.get_queryset().filter(company_id=company_id)
+        page = self.paginate_queryset(queryset)
+        if page is not None:
+            serializer = self.get_serializer(page, many=True)
+            return self.get_paginated_response(serializer.data)
+        serializer = self.get_serializer(queryset, many=True)
+        return Response(serializer.data)
 
     def create(self, request, *args, **kwargs):
         response = super().create(request, *args, **kwargs)

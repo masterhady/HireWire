@@ -81,7 +81,6 @@ class JobViewSet(viewsets.ModelViewSet):
     def create(self, request, *args, **kwargs):
         response = super().create(request, *args, **kwargs)
         if response.status_code == status.HTTP_201_CREATED:
-            job_id = response.data.get("id")
             title = response.data.get("title")
             description = response.data.get("description")
             requirements = response.data.get("requirements")

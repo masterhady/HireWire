@@ -174,7 +174,7 @@ def search_similar_jobs(embedding: List[float], top_n: int = 10, similarity_thre
             FROM job_embeddings e
             JOIN jobs j ON j.id = e.job_id
             WHERE j.is_active = TRUE
-            ORDER BY e.embedding <=> %s::vector
+            ORDER BY (e.embedding <=> %s::vector) NULLS LAST
             LIMIT %s
             """,
             [emb_literal, emb_literal, top_n],
@@ -183,7 +183,28 @@ def search_similar_jobs(embedding: List[float], top_n: int = 10, similarity_thre
 
     # Filter by similarity_threshold in Python to avoid casting surprises
     filtered = [row for row in rows if (row and len(row) >= 7 and row[6] is not None and float(row[6]) >= similarity_threshold)]
-    return filtered
+    if filtered:
+        return filtered
+
+    # Fallback: return some active jobs with raw similarity scores (no threshold)
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT j.id, j.title, j.description, j.requirements, j.company_id,
+                       e.embedding, (1 - (e.embedding <=> %s::vector)) AS score
+                FROM job_embeddings e
+                JOIN jobs j ON j.id = e.job_id
+                WHERE j.is_active = TRUE
+                ORDER BY (e.embedding <=> %s::vector) NULLS LAST
+                LIMIT %s
+                """,
+                [emb_literal, emb_literal, max(top_n, 10)],
+            )
+            fallback_rows = cursor.fetchall()
+        return fallback_rows or []
+    except Exception:
+        return []
 
 
 def generate_answer(query: str, jobs: List[Tuple]) -> str:
@@ -234,33 +255,40 @@ def search_similar_jobs(embedding: List[float], top_n: int = 10, similarity_thre
     Returns:
         List of tuples with job data and similarity scores
     """
-    # Convert embedding list to a pgvector literal string (e.g. [0.1,0.2,...]) so
-    # we can safely cast it in SQL with %s::vector.
+    if not embedding:
+        return []
+
+    # Convert embedding list to a pgvector literal string (e.g. [0.1,0.2,...])
     emb_literal = "[" + ",".join(map(str, embedding)) + "]"
 
-    # Fetch a larger candidate set (not strictly limited by top_n) so we can
-    # filter by similarity_threshold in Python and return all matches above
-    # the threshold. This avoids missing matches when top_n is small.
+    # We'll select the single best (nearest) embedding row per job using
+    # DISTINCT ON (j.id) ordered by distance. Then outer-query sorts by the
+    # computed score and we limit to the requested top_n. This removes duplicate
+    # job rows when multiple chunk embeddings exist for the same job.
     sql_limit = max(top_n, 100)
     with connection.cursor() as cursor:
         cursor.execute(
             """
-            SELECT j.id, j.title, j.description, j.requirements, j.company_id,
-                   e.embedding, (1 - (e.embedding <=> %s::vector)) AS score
-            FROM job_embeddings e
-            JOIN jobs j ON j.id = e.job_id
-            WHERE j.is_active = TRUE
-            ORDER BY e.embedding <=> %s::vector
+            SELECT q.id, q.title, q.description, q.requirements, q.company_id, q.score
+            FROM (
+              SELECT DISTINCT ON (j.id)
+                     j.id, j.title, j.description, j.requirements, j.company_id,
+                     (1 - (e.embedding <=> %s::vector)) AS score
+              FROM job_embeddings e
+              JOIN jobs j ON j.id = e.job_id
+              WHERE j.is_active = TRUE
+              ORDER BY j.id, e.embedding <=> %s::vector
+            ) q
+            ORDER BY q.score DESC
             LIMIT %s
             """,
             [emb_literal, emb_literal, sql_limit],
         )
         rows = cursor.fetchall()
 
-    # rows: (id, title, description, requirements, company_id, embedding, score)
-    # Filter by similarity_threshold in Python and return all matches above the
-    # threshold (up to the sql_limit we requested).
-    filtered = [row for row in rows if (row and len(row) >= 7 and row[6] is not None and float(row[6]) >= similarity_threshold)]
+    # rows: (id, title, description, requirements, company_id, score)
+    # Filter by similarity_threshold in Python and return matches above the threshold.
+    filtered = [row for row in rows if (row and len(row) >= 6 and row[5] is not None and float(row[5]) >= similarity_threshold)]
     return filtered
 
 

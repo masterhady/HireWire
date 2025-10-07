@@ -168,6 +168,8 @@ class RAGSearchView(APIView):
         query = request.data.get("query")
         top_n = int(request.data.get("top_n", 5))
         similarity_threshold = float(request.data.get("similarity_threshold", 0.3))
+        must_contain = request.data.get("must_contain") or []
+        must_not_contain = request.data.get("must_not_contain") or []
         
         if not query:
             return Response({"detail": "query is required"}, status=400)
@@ -176,17 +178,40 @@ class RAGSearchView(APIView):
             q_emb = embed_text(query)
             rows = search_similar_jobs(q_emb, top_n=top_n, similarity_threshold=similarity_threshold)
             
-            jobs = [
-                {
-                    "id": str(row[0]),
-                    "title": row[1],
-                    "description": row[2],
-                    "requirements": row[3],
-                    "company": str(row[4]),
-                    "score": float(row[6]),
-                }
-                for row in rows
-            ]
+            jobs = []
+            for row in rows or []:
+                try:
+                    if not row or len(row) < 6:
+                        continue
+                    # Handle two row shapes:
+                    #  - With embedding: (.., embedding, score) → score at index 6
+                    #  - Without embedding: (.., score) → score at index 5
+                    score_idx = 6 if len(row) >= 7 else 5
+                    score_val = row[score_idx]
+                    if score_val is None:
+                        continue
+                    jobs.append({
+                        "id": str(row[0]),
+                        "title": row[1],
+                        "description": row[2],
+                        "requirements": row[3],
+                        "company": str(row[4]) if row[4] is not None else None,
+                        "score": float(score_val),
+                    })
+                except Exception:
+                    # Skip malformed rows defensively
+                    continue
+            # Optional keyword filtering (case-insensitive)
+            def _text_blob(j):
+                return f"{j.get('title') or ''} {j.get('description') or ''} {j.get('requirements') or ''}".lower()
+
+            if must_contain:
+                kws = [str(k).lower() for k in (must_contain if isinstance(must_contain, list) else [must_contain])]
+                jobs = [j for j in jobs if any(k in _text_blob(j) for k in kws)]
+
+            if must_not_contain:
+                bad = [str(k).lower() for k in (must_not_contain if isinstance(must_not_contain, list) else [must_not_contain])]
+                jobs = [j for j in jobs if all(k not in _text_blob(j) for k in bad)]
             
             # If no rows were returned, try to sample a stored embedding to
             # detect a possible embedding-dimension mismatch (common cause when
@@ -246,18 +271,62 @@ class CVMatchView(APIView):
         cv_text = request.data.get("cv_text")
         top_n = int(request.data.get("top_n", 5))
         similarity_threshold = float(request.data.get("similarity_threshold", 0.3))
+        must_contain = request.data.get("must_contain") or []
+        must_not_contain = request.data.get("must_not_contain") or []
 
-        # Optionally support simple text file upload (plain text only)
+        # Support file upload: .txt (plain), .pdf (PyPDF2), .docx (python-docx)
         if not cv_text and hasattr(request, 'FILES'):
             f = request.FILES.get('file') or request.FILES.get('cv_file')
             if f is not None:
                 try:
-                    # Attempt utf-8 decode; if it fails, fall back to latin-1
+                    name = getattr(f, 'name', '') or ''
+                    lower_name = name.lower()
+                    content_type = getattr(f, 'content_type', '') or ''
+                    # Read bytes once
                     content = f.read()
-                    try:
-                        cv_text = content.decode('utf-8')
-                    except Exception:
-                        cv_text = content.decode('latin-1', errors='ignore')
+                    # Try by extension/content-type
+                    if lower_name.endswith('.txt') or content_type.startswith('text/'):
+                        try:
+                            cv_text = content.decode('utf-8')
+                        except Exception:
+                            cv_text = content.decode('latin-1', errors='ignore')
+                    elif lower_name.endswith('.pdf') or 'pdf' in content_type:
+                        try:
+                            # Lazy import; optional dependency
+                            import PyPDF2  # type: ignore
+                            from io import BytesIO
+                            pdf = PyPDF2.PdfReader(BytesIO(content))
+                            parts = []
+                            for page in pdf.pages:
+                                try:
+                                    parts.append(page.extract_text() or '')
+                                except Exception:
+                                    continue
+                            cv_text = "\n".join(parts).strip()
+                        except Exception as e:
+                            return Response({
+                                "detail": f"PDF parsing failed: {e}",
+                                "hint": "Install PyPDF2 or upload a .txt file",
+                            }, status=400)
+                    elif lower_name.endswith('.docx') or 'officedocument.wordprocessingml' in content_type:
+                        try:
+                            # Lazy import; optional dependency
+                            import docx  # type: ignore
+                            from io import BytesIO
+                            doc = docx.Document(BytesIO(content))
+                            cv_text = "\n".join(p.text for p in doc.paragraphs).strip()
+                        except Exception as e:
+                            return Response({
+                                "detail": f"DOCX parsing failed: {e}",
+                                "hint": "Install python-docx or upload a .txt file",
+                            }, status=400)
+                    else:
+                        return Response({
+                            "detail": "Unsupported file type for CV",
+                            "hint": "Upload .txt, .pdf, or .docx",
+                            "received_content_type": content_type,
+                            "filename": name,
+                        }, status=400)
                 except Exception as e:
                     return Response({"detail": f"Could not read uploaded file: {e}"}, status=400)
 
@@ -268,47 +337,153 @@ class CVMatchView(APIView):
             # Embed the entire CV text. If very long, chunk first and average embeddings.
             chunks = chunk_text(cv_text)
             if not chunks:
-                return Response({"detail": "No readable content in CV"}, status=400)
+                return Response({"detail": "No readable content in CV", "diagnostic": {"cv_text_len": len(cv_text or '')}}, status=400)
 
             emb_list = []
             for ch in chunks:
                 try:
                     emb_list.append(embed_text(ch))
-                except Exception as e:
-                    # Skip failed chunks; proceed with others
+                except Exception:
                     continue
 
             if not emb_list:
                 return Response({"detail": "Failed to embed CV content"}, status=400)
 
-            # Average embeddings to a single query vector
-            dim = len(emb_list[0])
-            agg = [0.0] * dim
+            # Search per chunk, aggregate by job with max score to avoid dilution
+            job_id_to_best = {}
             for vec in emb_list:
-                if len(vec) != dim:
+                if not vec:
                     continue
-                for i in range(dim):
-                    agg[i] += float(vec[i])
-            q_emb = [v / max(1, len(emb_list)) for v in agg]
+                rows = search_similar_jobs(vec, top_n=max(top_n, 20), similarity_threshold=0.0)
+                for row in rows or []:
+                    try:
+                        if not row or len(row) < 6:
+                            continue
+                        score_idx = 6 if len(row) >= 7 else 5
+                        score_val = row[score_idx]
+                        if score_val is None:
+                            continue
+                        job_id = str(row[0])
+                        score_f = float(score_val)
+                        existing = job_id_to_best.get(job_id)
+                        if existing is None or score_f > existing.get("score", 0.0):
+                            job_id_to_best[job_id] = {
+                                "id": job_id,
+                                "title": row[1],
+                                "description": row[2],
+                                "requirements": row[3],
+                                "company": str(row[4]) if row[4] is not None else None,
+                                "score": score_f,
+                            }
+                    except Exception:
+                        continue
 
-            rows = search_similar_jobs(q_emb, top_n=top_n, similarity_threshold=similarity_threshold)
-            jobs = [
-                {
-                    "id": str(row[0]),
-                    "title": row[1],
-                    "description": row[2],
-                    "requirements": row[3],
-                    "company": str(row[4]),
-                    "score": float(row[6]),
-                }
-                for row in rows
-            ]
+            # Build list and apply similarity_threshold
+            jobs = [j for j in job_id_to_best.values() if j.get("score", 0.0) >= similarity_threshold]
+            jobs.sort(key=lambda x: x.get("score", 0.0), reverse=True)
+            # Optional keyword filtering (case-insensitive)
+            def _text_blob_cv(j):
+                return f"{j.get('title') or ''} {j.get('description') or ''} {j.get('requirements') or ''}".lower()
+
+            if must_contain:
+                kws = [str(k).lower() for k in (must_contain if isinstance(must_contain, list) else [must_contain])]
+                jobs = [j for j in jobs if any(k in _text_blob_cv(j) for k in kws)]
+
+            if must_not_contain:
+                bad = [str(k).lower() for k in (must_not_contain if isinstance(must_not_contain, list) else [must_not_contain])]
+                jobs = [j for j in jobs if all(k not in _text_blob_cv(j) for k in bad)]
+
+            if jobs:
+                return Response({
+                    "query_type": "cv",
+                    "results": jobs,
+                    "total_matches": len(jobs),
+                    "similarity_threshold": similarity_threshold
+                }, status=200)
+
+            # If no matches, include diagnostics and a low-threshold sample to debug
+            stored_embedding_dim = None
+            total_embeddings = None
+            active_embeddings = None
+            try:
+                with connection.cursor() as c:
+                    c.execute("SELECT COUNT(*) FROM job_embeddings")
+                    total_embeddings = c.fetchone()[0]
+                    c.execute("SELECT embedding FROM job_embeddings LIMIT 1")
+                    one = c.fetchone()
+                    if one and one[0] is not None:
+                        emb_val = one[0]
+                        if isinstance(emb_val, (list, tuple)):
+                            stored_embedding_dim = len(emb_val)
+                        elif isinstance(emb_val, str):
+                            s = emb_val.strip()
+                            if s.startswith("[") and s.endswith("]"):
+                                stored_embedding_dim = len([x for x in s[1:-1].split(",") if x.strip() != ""]) 
+                    # Count active jobs that have embeddings
+                    c.execute("""
+                        SELECT COUNT(*)
+                        FROM job_embeddings e
+                        JOIN jobs j ON j.id = e.job_id
+                        WHERE j.is_active = TRUE
+                    """)
+                    active_embeddings = c.fetchone()[0]
+            except Exception:
+                pass
+
+            # Try again with a very low threshold to surface scores (using first chunk)
+            sample_vec = emb_list[0]
+            fallback_rows = search_similar_jobs(sample_vec, top_n=max(top_n, 10), similarity_threshold=0.0)
+            fallback = []
+            for row in fallback_rows or []:
+                try:
+                    if not row or len(row) < 7 or row[6] is None:
+                        continue
+                    fallback.append({
+                        "id": str(row[0]),
+                        "title": row[1],
+                        "score": float(row[6]),
+                    })
+                except Exception:
+                    continue
+
+            # Extra diagnostics: check raw distances and query vector magnitude
+            raw_dist_samples = []
+            q_sum_abs = sum(abs(x) for x in sample_vec if isinstance(x, (int, float)))
+            try:
+                emb_literal = "[" + ",".join(map(str, sample_vec)) + "]"
+                with connection.cursor() as c:
+                    c.execute(
+                        """
+                        SELECT j.id,
+                               (e.embedding <=> %s::vector) AS distance
+                        FROM job_embeddings e
+                        JOIN jobs j ON j.id = e.job_id
+                        WHERE j.is_active = TRUE
+                        ORDER BY distance NULLS LAST
+                        LIMIT 5
+                        """,
+                        [emb_literal],
+                    )
+                    for rid, dist in c.fetchall() or []:
+                        raw_dist_samples.append({"id": str(rid), "distance": None if dist is None else float(dist)})
+            except Exception:
+                pass
 
             return Response({
                 "query_type": "cv",
                 "results": jobs,
-                "total_matches": len(jobs),
-                "similarity_threshold": similarity_threshold
+                "total_matches": 0,
+                "similarity_threshold": similarity_threshold,
+                "diagnostic": {
+                    "stored_embedding_dim": stored_embedding_dim,
+                    "query_embedding_dim": len(sample_vec) if sample_vec else None,
+                    "configured_fireworks_dim": EMB_DIM,
+                    "total_embeddings": total_embeddings,
+                    "active_embeddings": active_embeddings,
+                    "low_threshold_samples": fallback[:5],
+                    "query_vector_sum_abs": q_sum_abs,
+                    "raw_distance_samples": raw_dist_samples,
+                },
             }, status=200)
         except Exception as e:
             return Response({"detail": str(e)}, status=400)

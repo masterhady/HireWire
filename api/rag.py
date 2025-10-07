@@ -16,6 +16,43 @@ EMBEDDING_PROVIDER = config("EMBEDDING_PROVIDER", default="openai")  # openai | 
 EMBEDDING_MODEL = config("OPENAI_EMBEDDING_MODEL", default="text-embedding-3-small")
 CHAT_MODEL = config("OPENAI_CHAT_MODEL", default="gpt-4o-mini")
 OPENAI_API_KEY = config("OPENAI_API_KEY", default=None)
+import os
+from typing import List, Tuple
+from decouple import config
+from django.db import connection
+
+try:
+    from openai import OpenAI
+except Exception:
+    OpenAI = None
+
+import requests
+
+EMBEDDING_PROVIDER = config("EMBEDDING_PROVIDER", default="openai")  # openai | fireworks
+
+# OpenAI config (used if provider=openai)
+EMBEDDING_MODEL = config("OPENAI_EMBEDDING_MODEL", default="text-embedding-3-small")
+CHAT_MODEL = config("OPENAI_CHAT_MODEL", default="gpt-4o-mini")
+OPENAI_API_KEY = config("OPENAI_API_KEY", default=None)
+
+import os
+from typing import List, Tuple
+from decouple import config
+from django.db import connection
+
+try:
+    from openai import OpenAI
+except Exception:
+    OpenAI = None
+
+import requests
+
+EMBEDDING_PROVIDER = config("EMBEDDING_PROVIDER", default="openai")  # openai | fireworks
+
+# OpenAI config (used if provider=openai)
+EMBEDDING_MODEL = config("OPENAI_EMBEDDING_MODEL", default="text-embedding-3-small")
+CHAT_MODEL = config("OPENAI_CHAT_MODEL", default="gpt-4o-mini")
+OPENAI_API_KEY = config("OPENAI_API_KEY", default=None)
 
 # Fireworks config (used if provider=fireworks)
 FIREWORKS_API_KEY = config("FIREWORKS_API_KEY", default=None)
@@ -69,6 +106,109 @@ def embed_text_fireworks(text: str) -> List[float]:
         "Authorization": f"Bearer {FIREWORKS_API_KEY}",
         "Content-Type": "application/json",
     }
+    # Try the request. If the service returns a 5xx and we included an
+    # explicit `dimensions` field, retry once without it (some models do
+    # not expect or accept the dimensions parameter).
+    try:
+        r = requests.post(url, json=payload, headers=headers, timeout=30)
+    except Exception as e:
+        raise RuntimeError(f"Fireworks request failed: {e}")
+
+    if not r.ok and FIREWORKS_EMBEDDING_DIM and r.status_code >= 500:
+        # Retry without dimensions
+        try:
+            payload2 = {"input": text, "model": FIREWORKS_EMBEDDING_MODEL}
+            r2 = requests.post(url, json=payload2, headers=headers, timeout=30)
+        except Exception as e:
+            raise RuntimeError(f"Fireworks request failed on retry: {e}")
+        if not r2.ok:
+            body = None
+            try:
+                body = r2.text
+            except Exception:
+                body = "<unreadable response body>"
+            raise RuntimeError(f"Fireworks embedding error (retry): status={r2.status_code}, body={body}")
+        data = r2.json()
+        try:
+            return data["data"][0]["embedding"]
+        except Exception as e:
+            raise RuntimeError(f"Unexpected Fireworks response shape (retry): {e} - {data}")
+
+    # If first response was not OK and not retriable, raise with body
+    if not r.ok:
+        body = None
+        try:
+            body = r.text
+        except Exception:
+            body = "<unreadable response body>"
+        raise RuntimeError(f"Fireworks embedding error: status={r.status_code}, body={body}")
+
+    data = r.json()
+    try:
+        return data["data"][0]["embedding"]
+    except Exception as e:
+        raise RuntimeError(f"Unexpected Fireworks response shape: {e} - {data}")
+
+
+def embed_text(text: str) -> List[float]:
+    if EMBEDDING_PROVIDER.lower() == "fireworks":
+        return embed_text_fireworks(text)
+    return embed_text_openai(text)
+
+
+def search_similar_jobs(embedding: List[float], top_n: int = 10, similarity_threshold: float = 0.3) -> List[Tuple]:
+    """
+    Search for similar jobs using cosine similarity with pgvector.
+    """
+    if not embedding:
+        return []
+
+    # Convert embedding list to a pgvector literal string (e.g. [0.1,0.2,...])
+    emb_literal = "[" + ",".join(map(str, embedding)) + "]"
+
+    with connection.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT j.id, j.title, j.description, j.requirements, j.company_id,
+                   e.embedding, (1 - (e.embedding <=> %s::vector)) AS score
+            FROM job_embeddings e
+            JOIN jobs j ON j.id = e.job_id
+            WHERE j.is_active = TRUE
+            ORDER BY e.embedding <=> %s::vector
+            LIMIT %s
+            """,
+            [emb_literal, emb_literal, top_n],
+        )
+        rows = cursor.fetchall()
+
+    # Filter by similarity_threshold in Python to avoid casting surprises
+    filtered = [row for row in rows if (row and len(row) >= 7 and row[6] is not None and float(row[6]) >= similarity_threshold)]
+    return filtered
+
+
+def generate_answer(query: str, jobs: List[Tuple]) -> str:
+    if not OPENAI_API_KEY or OpenAI is None:
+        return "Summary unavailable: chat model not configured (OPENAI_API_KEY missing). Matching results are still returned."
+    client = get_openai_client()
+    context_lines = []
+    for idx, (job_id, title, description, requirements, company_id, _, score) in enumerate(jobs, start=1):
+        context_lines.append(f"[{idx}] {title} (score={score:.3f})\nDesc: {description}\nReq: {requirements}\n")
+    context = "\n".join(context_lines)
+    prompt = (
+        "You are a helpful assistant for job recommendations. "
+        "Given the user's query and the top matched jobs (with descriptions and requirements), "
+        "summarize why these jobs are relevant and suggest next steps."
+    )
+    messages = [
+        {"role": "system", "content": prompt},
+        {"role": "user", "content": f"User query:\n{query}\n\nMatched jobs:\n{context}"},
+    ]
+    resp = client.chat.completions.create(model=CHAT_MODEL, messages=messages, temperature=0.2)
+    return resp.choices[0].message.content.strip()
+    headers = {
+        "Authorization": f"Bearer {FIREWORKS_API_KEY}",
+        "Content-Type": "application/json",
+    }
     r = requests.post(url, json=payload, headers=headers, timeout=30)
     r.raise_for_status()
     data = r.json()
@@ -94,7 +234,14 @@ def search_similar_jobs(embedding: List[float], top_n: int = 10, similarity_thre
     Returns:
         List of tuples with job data and similarity scores
     """
-    # pgvector cosine distance: ORDER BY embedding <=> query_embedding LIMIT top_n
+    # Convert embedding list to a pgvector literal string (e.g. [0.1,0.2,...]) so
+    # we can safely cast it in SQL with %s::vector.
+    emb_literal = "[" + ",".join(map(str, embedding)) + "]"
+
+    # Fetch a larger candidate set (not strictly limited by top_n) so we can
+    # filter by similarity_threshold in Python and return all matches above
+    # the threshold. This avoids missing matches when top_n is small.
+    sql_limit = max(top_n, 100)
     with connection.cursor() as cursor:
         cursor.execute(
             """
@@ -103,20 +250,24 @@ def search_similar_jobs(embedding: List[float], top_n: int = 10, similarity_thre
             FROM job_embeddings e
             JOIN jobs j ON j.id = e.job_id
             WHERE j.is_active = TRUE
-              AND (1 - (e.embedding <=> %s::vector)) >= %s
             ORDER BY e.embedding <=> %s::vector
             LIMIT %s
             """,
-            [embedding, embedding, similarity_threshold, embedding, top_n],
+            [emb_literal, emb_literal, sql_limit],
         )
         rows = cursor.fetchall()
-    return rows
+
+    # rows: (id, title, description, requirements, company_id, embedding, score)
+    # Filter by similarity_threshold in Python and return all matches above the
+    # threshold (up to the sql_limit we requested).
+    filtered = [row for row in rows if (row and len(row) >= 7 and row[6] is not None and float(row[6]) >= similarity_threshold)]
+    return filtered
 
 
 def generate_answer(query: str, jobs: List[Tuple]) -> str:
     # If OpenAI chat is not configured, return a fallback summary instead of raising
     if not OPENAI_API_KEY or OpenAI is None:
-        return "Summary unavailable: OPENAI_API_KEY not set. Results are still provided."
+        return "Summary unavailable: chat model not configured (OPENAI_API_KEY missing). Matching results are still returned."
     client = get_openai_client()
     context_lines = []
     for idx, (job_id, title, description, requirements, company_id, _, score) in enumerate(jobs, start=1):
@@ -132,4 +283,4 @@ def generate_answer(query: str, jobs: List[Tuple]) -> str:
         {"role": "user", "content": f"User query:\n{query}\n\nMatched jobs:\n{context}"},
     ]
     resp = client.chat.completions.create(model=CHAT_MODEL, messages=messages, temperature=0.2)
-    return resp.choices[0].message.content.strip() 
+    return resp.choices[0].message.content.strip()

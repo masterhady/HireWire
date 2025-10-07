@@ -84,24 +84,36 @@ class JobViewSet(viewsets.ModelViewSet):
             title = response.data.get("title")
             description = response.data.get("description")
             requirements = response.data.get("requirements")
-            text = f"{title}\n{description or ''}\n{requirements or ''}".strip()
+            text = (f"{title}\n{description or ''}\n{requirements or ''}").strip()
             
             chunks = chunk_text(text)
             
+            embedding_errors = []
             for i, chunk in enumerate(chunks or []):
                 try:
                     emb = embed_text(chunk)
-                    
+
                     if EMB_DIM and len(emb) != EMB_DIM:
+                        embedding_errors.append(f"chunk_{i}: unexpected dim {len(emb)}")
                         continue
-                        
+
                     with connection.cursor() as c:
+                        job_id = response.data.get("id")
+                        emb_literal = "[" + ",".join(map(str, emb)) + "]"
                         c.execute(
                             "INSERT INTO job_embeddings (id, job_id, created_at, embedding) VALUES (%s, %s, NOW(), %s::vector)",
-                            [str(uuid.uuid4()), str(job_id), emb],
+                            [str(uuid.uuid4()), str(job_id), emb_literal],
                         )
                 except Exception as e:
-                    continue
+                    # collect errors to return in the response for debugging
+                    embedding_errors.append(f"chunk_{i}: {e}")
+
+            # If there were embedding errors, attach them to the response for now
+            if embedding_errors:
+                # don't fail the creation; return a warning in the response body
+                data = dict(response.data)
+                data["embedding_warnings"] = embedding_errors
+                return Response(data, status=response.status_code)
         return response
 
     @action(detail=True, methods=["post"], url_path="skills")
@@ -176,8 +188,45 @@ class RAGSearchView(APIView):
                 for row in rows
             ]
             
+            # If no rows were returned, try to sample a stored embedding to
+            # detect a possible embedding-dimension mismatch (common cause when
+            # embeddings were generated with a different dimension than the
+            # current server config).
+            stored_embedding_dim = None
+            try:
+                with connection.cursor() as c:
+                    c.execute("SELECT embedding FROM job_embeddings LIMIT 1")
+                    one = c.fetchone()
+                    if one and one[0] is not None:
+                        emb_val = one[0]
+                        # pgvector may come back as a list, or a string like '[0.1,0.2,...]'
+                        if isinstance(emb_val, (list, tuple)):
+                            stored_embedding_dim = len(emb_val)
+                        elif isinstance(emb_val, str):
+                            s = emb_val.strip()
+                            if s.startswith("[") and s.endswith("]"):
+                                stored_embedding_dim = len([x for x in s[1:-1].split(",") if x.strip() != ""]) 
+            except Exception:
+                stored_embedding_dim = None
+
             summary = generate_answer(query, rows)
-            
+
+            # If no matches, include diagnostic info to help debug embedding
+            # dimension mismatches or provider/config issues.
+            if not jobs:
+                return Response({
+                    "query": query,
+                    "results": jobs,
+                    "summary": summary,
+                    "total_matches": 0,
+                    "similarity_threshold": similarity_threshold,
+                    "diagnostic": {
+                        "stored_embedding_dim": stored_embedding_dim,
+                        "query_embedding_dim": len(q_emb) if isinstance(q_emb, (list, tuple)) else None,
+                        "configured_fireworks_dim": EMB_DIM,
+                    },
+                }, status=200)
+
             return Response({
                 "query": query, 
                 "results": jobs, 
@@ -187,4 +236,4 @@ class RAGSearchView(APIView):
             }, status=200)
             
         except Exception as e:
-            return Response({"detail": str(e)}, status=400) 
+            return Response({"detail": str(e)}, status=400)

@@ -15,6 +15,7 @@ from .supabase_views import (
     ApplicationViewSet,
     RecommendationViewSet,
     RAGSearchView,
+    CVMatchView,
 )
 
 router = DefaultRouter()
@@ -34,5 +35,6 @@ urlpatterns = [
     path("auth/token/refresh/", TokenRefreshView.as_view(), name="token_refresh"),
     path("test-supabase/", test_supabase_connection, name="test_supabase_connection"),
     path("rag/search/", RAGSearchView.as_view(), name="rag_search"),
+    path("rag/cv-match/", CVMatchView.as_view(), name="rag_cv_match"),
     path("", include(router.urls)),
 ]

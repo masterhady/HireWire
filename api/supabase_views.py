@@ -237,3 +237,78 @@ class RAGSearchView(APIView):
             
         except Exception as e:
             return Response({"detail": str(e)}, status=400)
+
+
+class CVMatchView(APIView):
+    permission_classes = [permissions.AllowAny]
+
+    def post(self, request):
+        cv_text = request.data.get("cv_text")
+        top_n = int(request.data.get("top_n", 5))
+        similarity_threshold = float(request.data.get("similarity_threshold", 0.3))
+
+        # Optionally support simple text file upload (plain text only)
+        if not cv_text and hasattr(request, 'FILES'):
+            f = request.FILES.get('file') or request.FILES.get('cv_file')
+            if f is not None:
+                try:
+                    # Attempt utf-8 decode; if it fails, fall back to latin-1
+                    content = f.read()
+                    try:
+                        cv_text = content.decode('utf-8')
+                    except Exception:
+                        cv_text = content.decode('latin-1', errors='ignore')
+                except Exception as e:
+                    return Response({"detail": f"Could not read uploaded file: {e}"}, status=400)
+
+        if not cv_text:
+            return Response({"detail": "cv_text or file is required"}, status=400)
+
+        try:
+            # Embed the entire CV text. If very long, chunk first and average embeddings.
+            chunks = chunk_text(cv_text)
+            if not chunks:
+                return Response({"detail": "No readable content in CV"}, status=400)
+
+            emb_list = []
+            for ch in chunks:
+                try:
+                    emb_list.append(embed_text(ch))
+                except Exception as e:
+                    # Skip failed chunks; proceed with others
+                    continue
+
+            if not emb_list:
+                return Response({"detail": "Failed to embed CV content"}, status=400)
+
+            # Average embeddings to a single query vector
+            dim = len(emb_list[0])
+            agg = [0.0] * dim
+            for vec in emb_list:
+                if len(vec) != dim:
+                    continue
+                for i in range(dim):
+                    agg[i] += float(vec[i])
+            q_emb = [v / max(1, len(emb_list)) for v in agg]
+
+            rows = search_similar_jobs(q_emb, top_n=top_n, similarity_threshold=similarity_threshold)
+            jobs = [
+                {
+                    "id": str(row[0]),
+                    "title": row[1],
+                    "description": row[2],
+                    "requirements": row[3],
+                    "company": str(row[4]),
+                    "score": float(row[6]),
+                }
+                for row in rows
+            ]
+
+            return Response({
+                "query_type": "cv",
+                "results": jobs,
+                "total_matches": len(jobs),
+                "similarity_threshold": similarity_threshold
+            }, status=200)
+        except Exception as e:
+            return Response({"detail": str(e)}, status=400)

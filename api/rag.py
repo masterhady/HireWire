@@ -188,7 +188,7 @@ def search_similar_jobs(embedding: List[float], top_n: int = 10, similarity_thre
 
 def generate_answer(query: str, jobs: List[Tuple]) -> str:
     if not OPENAI_API_KEY or OpenAI is None:
-        return "Summary unavailable: chat model not configured (OPENAI_API_KEY missing). Matching results are still returned."
+        return "Summary disabled: chat model not configured. Returning results without summary."
     client = get_openai_client()
     context_lines = []
     for idx, (job_id, title, description, requirements, company_id, _, score) in enumerate(jobs, start=1):
@@ -267,7 +267,7 @@ def search_similar_jobs(embedding: List[float], top_n: int = 10, similarity_thre
 def generate_answer(query: str, jobs: List[Tuple]) -> str:
     # If OpenAI chat is not configured, return a fallback summary instead of raising
     if not OPENAI_API_KEY or OpenAI is None:
-        return "Summary unavailable: chat model not configured (OPENAI_API_KEY missing). Matching results are still returned."
+        return "Summary disabled: chat model not configured. Returning results without summary."
     client = get_openai_client()
     context_lines = []
     for idx, (job_id, title, description, requirements, company_id, _, score) in enumerate(jobs, start=1):

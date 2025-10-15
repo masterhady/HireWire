@@ -638,3 +638,169 @@ curl -X GET http://localhost:8080/api/companies/ \
 - The `job_skills` relationship is managed through the job endpoints
 - Public endpoints: register, login, token refresh, and GET skills
 - All other endpoints require JWT authentication
+
+---
+
+## RAG and CV Endpoints (New)
+
+### RAG Text Search
+**POST** `/rag/search/`
+
+**Description:** Retrieve similar jobs for a free-text query using vector search. Optionally returns an AI summary if configured.
+
+**Authentication:** Not required
+
+**Request Body:**
+```json
+{
+  "query": "string (required)",
+  "top_n": 10,
+  "similarity_threshold": 0.35,
+  "must_contain": ["django", "postgres"],
+  "must_not_contain": ["intern"]
+}
+```
+
+**Example:**
+```bash
+curl -X POST http://localhost:8080/api/rag/search/ \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query": "senior backend engineer python django postgres",
+    "top_n": 10,
+    "similarity_threshold": 0.35
+  }'
+```
+
+---
+
+### Upload/Upsert CV
+**POST** `/rag/cv-upload/`
+
+**Description:** Upload or update the authenticated user's single CV. Parses `.txt`, `.pdf`, `.docx`; stores text in `cvs` and chunk embeddings in `cv_embeddings`.
+
+**Authentication:** Required
+
+**Body (multipart or JSON):**
+```json
+{
+  "cv_text": "string (optional if file provided)",
+  "filename": "string (optional)"
+}
+```
+
+**Notes:**
+- If a CV already exists for the user, it will be updated and its embeddings replaced.
+- Non-CV content is rejected with 415.
+
+**Examples:**
+```bash
+# File upload
+curl -X POST http://localhost:8080/api/rag/cv-upload/ \
+  -H "Authorization: Bearer <access_token>" \
+  -F "file=@/path/to/resume.pdf"
+
+# Raw text
+curl -X POST http://localhost:8080/api/rag/cv-upload/ \
+  -H "Authorization: Bearer <access_token>" \
+  -H "Content-Type: application/json" \
+  -d '{"cv_text":"...","filename":"resume.txt"}'
+```
+
+---
+
+### CV Match (by stored CV or text)
+**POST** `/rag/cv-match/`
+
+**Description:** Find best-matching jobs for a CV. Uses the provided `cv_id` or `cv_text`. If neither is provided, uses the latest uploaded CV of the authenticated user.
+
+**Authentication:** Required
+
+**Request Body:**
+```json
+{
+  "cv_id": "uuid (optional)",
+  "cv_text": "string (optional)",
+  "top_n": 10,
+  "similarity_threshold": 0.3,
+  "must_contain": ["python"],
+  "must_not_contain": ["intern"]
+}
+```
+
+**Examples:**
+```bash
+# Use latest uploaded CV automatically
+curl -X POST http://localhost:8080/api/rag/cv-match/ \
+  -H "Authorization: Bearer <access_token>" \
+  -H "Content-Type: application/json" \
+  -d '{"top_n": 10, "similarity_threshold": 0.3}'
+
+# Use specific stored CV
+curl -X POST http://localhost:8080/api/rag/cv-match/ \
+  -H "Authorization: Bearer <access_token>" \
+  -H "Content-Type: application/json" \
+  -d '{"cv_id":"<cv_uuid>", "top_n": 10}'
+
+# Ad-hoc text (no storage)
+curl -X POST http://localhost:8080/api/rag/cv-match/ \
+  -H "Authorization: Bearer <access_token>" \
+  -H "Content-Type: application/json" \
+  -d '{"cv_text":"raw resume text here"}'
+```
+
+---
+
+### CV Recommendations (AI)
+**POST** `/rag/cv-recommendations/`
+
+**Description:** Uses Fireworks chat model to generate CV scores, tailored suggestions, and a structured CV extract for UI display.
+
+**Authentication:** Required
+
+**Request Body:**
+```json
+{
+  "cv_id": "uuid (optional)",
+  "cv_text": "string (optional)"
+}
+```
+
+**Response (fields):**
+- `overall_score`, `skills_match`, `experience_relevance`, `ats_readability`
+- `suggestions`: list of `{title, priority, details}`
+- `cv_extract`: `{ full_name, job_title, summary, skills[], experience[], contact{} }`
+
+**Examples:**
+```bash
+# Latest CV
+curl -X POST http://localhost:8080/api/rag/cv-recommendations/ \
+  -H "Authorization: Bearer <access_token>"
+
+# Specific CV
+curl -X POST http://localhost:8080/api/rag/cv-recommendations/ \
+  -H "Authorization: Bearer <access_token>" \
+  -H "Content-Type: application/json" \
+  -d '{"cv_id":"<cv_uuid>"}'
+
+# Raw text
+curl -X POST http://localhost:8080/api/rag/cv-recommendations/ \
+  -H "Authorization: Bearer <access_token>" \
+  -H "Content-Type: application/json" \
+  -d '{"cv_text":"..."}'
+```
+
+---
+
+### Dashboard Aggregate (New)
+**GET** `/dashboard/`
+
+**Description:** Returns data for the dashboard cards and lists: total job matches from the latest CV, AI CV score, placeholder profile views, and top 3 matches.
+
+**Authentication:** Required
+
+**Example:**
+```bash
+curl -X GET http://localhost:8080/api/dashboard/ \
+  -H "Authorization: Bearer <access_token>"
+```

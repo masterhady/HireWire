@@ -16,6 +16,9 @@ from .supabase_views import (
     RecommendationViewSet,
     RAGSearchView,
     CVMatchView,
+    CVUploadView,
+    CVRecommendationsView,
+    DashboardView,
 )
 
 router = DefaultRouter()
@@ -36,5 +39,8 @@ urlpatterns = [
     path("test-supabase/", test_supabase_connection, name="test_supabase_connection"),
     path("rag/search/", RAGSearchView.as_view(), name="rag_search"),
     path("rag/cv-match/", CVMatchView.as_view(), name="rag_cv_match"),
+    path("rag/cv-upload/", CVUploadView.as_view(), name="rag_cv_upload"),
+    path("rag/cv-recommendations/", CVRecommendationsView.as_view(), name="rag_cv_recommendations"),
+    path("dashboard/", DashboardView.as_view(), name="dashboard"),
     path("", include(router.urls)),
 ]

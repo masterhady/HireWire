@@ -3,6 +3,7 @@ from rest_framework import viewsets, permissions, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.views import APIView
+from django.utils import timezone
 import uuid
 
 from .supabase_models import (
@@ -27,8 +28,18 @@ from .supabase_serializers import (
     ApplicationSerializer,
     RecommendationSerializer,
 )
-from .rag import embed_text, search_similar_jobs, generate_answer, chunk_text
+from .rag import (
+    embed_text,
+    search_similar_jobs,
+    generate_answer,
+    chunk_text,
+    FIREWORKS_BASE_URL,
+    FIREWORKS_API_KEY,
+)
 from decouple import config
+import re
+import json
+import requests
 
 EMB_DIM = config("FIREWORKS_EMBEDDING_DIM", default=None, cast=int)
 
@@ -265,73 +276,56 @@ class RAGSearchView(APIView):
 
 
 class CVMatchView(APIView):
-    permission_classes = [permissions.AllowAny]
+    permission_classes = [permissions.IsAuthenticated]
 
     def post(self, request):
+        # New behavior: accept either cv_id (preferred) or raw cv_text. No file parsing here.
+        # If neither is provided, use the most recently uploaded CV for the authenticated user.
+        cv_id = request.data.get("cv_id")
         cv_text = request.data.get("cv_text")
         top_n = int(request.data.get("top_n", 5))
         similarity_threshold = float(request.data.get("similarity_threshold", 0.3))
         must_contain = request.data.get("must_contain") or []
         must_not_contain = request.data.get("must_not_contain") or []
 
-        # Support file upload: .txt (plain), .pdf (PyPDF2), .docx (python-docx)
-        if not cv_text and hasattr(request, 'FILES'):
-            f = request.FILES.get('file') or request.FILES.get('cv_file')
-            if f is not None:
-                try:
-                    name = getattr(f, 'name', '') or ''
-                    lower_name = name.lower()
-                    content_type = getattr(f, 'content_type', '') or ''
-                    # Read bytes once
-                    content = f.read()
-                    # Try by extension/content-type
-                    if lower_name.endswith('.txt') or content_type.startswith('text/'):
-                        try:
-                            cv_text = content.decode('utf-8')
-                        except Exception:
-                            cv_text = content.decode('latin-1', errors='ignore')
-                    elif lower_name.endswith('.pdf') or 'pdf' in content_type:
-                        try:
-                            # Lazy import; optional dependency
-                            import PyPDF2  # type: ignore
-                            from io import BytesIO
-                            pdf = PyPDF2.PdfReader(BytesIO(content))
-                            parts = []
-                            for page in pdf.pages:
-                                try:
-                                    parts.append(page.extract_text() or '')
-                                except Exception:
-                                    continue
-                            cv_text = "\n".join(parts).strip()
-                        except Exception as e:
-                            return Response({
-                                "detail": f"PDF parsing failed: {e}",
-                                "hint": "Install PyPDF2 or upload a .txt file",
-                            }, status=400)
-                    elif lower_name.endswith('.docx') or 'officedocument.wordprocessingml' in content_type:
-                        try:
-                            # Lazy import; optional dependency
-                            import docx  # type: ignore
-                            from io import BytesIO
-                            doc = docx.Document(BytesIO(content))
-                            cv_text = "\n".join(p.text for p in doc.paragraphs).strip()
-                        except Exception as e:
-                            return Response({
-                                "detail": f"DOCX parsing failed: {e}",
-                                "hint": "Install python-docx or upload a .txt file",
-                            }, status=400)
-                    else:
-                        return Response({
-                            "detail": "Unsupported file type for CV",
-                            "hint": "Upload .txt, .pdf, or .docx",
-                            "received_content_type": content_type,
-                            "filename": name,
-                        }, status=400)
-                except Exception as e:
-                    return Response({"detail": f"Could not read uploaded file: {e}"}, status=400)
+        # If cv_id is provided, fetch parsed_text from DB
+        if cv_id and not cv_text:
+            try:
+                cv_obj = CV.objects.get(id=cv_id)
+                cv_text = cv_obj.parsed_text or ""
+            except CV.DoesNotExist:
+                return Response({"detail": "cv_id not found"}, status=404)
+
+        # If neither cv_id nor cv_text provided, try to use last uploaded CV for authenticated user
+        if not cv_id and not cv_text:
+            try:
+                auth_user = getattr(request, "user", None)
+                auth_email = getattr(auth_user, "email", None)
+                sb_user = None
+                if auth_email:
+                    sb_user = SbUser.objects.filter(email=auth_email).first()
+                if not sb_user:
+                    return Response({
+                        "detail": "Associated Supabase user not found for authenticated account",
+                        "hint": "Ensure a matching SbUser exists with the same email as the logged-in user",
+                    }, status=404)
+                latest_cv = CV.objects.filter(user_id=sb_user.id).order_by('-created_at').first()
+                if not latest_cv:
+                    return Response({
+                        "detail": "No uploaded CV found for the authenticated user",
+                        "hint": "Upload a CV first using /api/rag/cv-upload/",
+                    }, status=404)
+                cv_text = latest_cv.parsed_text or ""
+                if not cv_text:
+                    return Response({
+                        "detail": "Latest CV has no parsed_text",
+                        "hint": "Re-upload the CV or provide cv_id/cv_text explicitly",
+                    }, status=400)
+            except Exception as e:
+                return Response({"detail": str(e)}, status=400)
 
         if not cv_text:
-            return Response({"detail": "cv_text or file is required"}, status=400)
+            return Response({"detail": "cv_text or cv_id is required"}, status=400)
 
         try:
             # Embed the entire CV text. If very long, chunk first and average embeddings.
@@ -485,5 +479,433 @@ class CVMatchView(APIView):
                     "raw_distance_samples": raw_dist_samples,
                 },
             }, status=200)
+        except Exception as e:
+            return Response({"detail": str(e)}, status=400)
+
+
+class CVUploadView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request):
+        """Upload and parse a CV (file or cv_text), store in DB, return cv_id.
+
+        Body (multipart/form-data or JSON):
+          - user: UUID (required)
+          - file: .txt/.pdf/.docx OR cv_text (string)
+          - filename: optional when using cv_text
+        """
+        filename = request.data.get("filename") or "uploaded_cv.txt"
+        cv_text = request.data.get("cv_text")
+
+        # Support file upload: .txt, .pdf, .docx
+        if not cv_text and hasattr(request, 'FILES'):
+            f = request.FILES.get('file') or request.FILES.get('cv_file')
+            if f is not None:
+                try:
+                    name = getattr(f, 'name', '') or ''
+                    if not request.data.get("filename"):
+                        filename = name or filename
+                    lower_name = name.lower()
+                    content_type = getattr(f, 'content_type', '') or ''
+                    content = f.read()
+                    if lower_name.endswith('.txt') or content_type.startswith('text/'):
+                        try:
+                            cv_text = content.decode('utf-8')
+                        except Exception:
+                            cv_text = content.decode('latin-1', errors='ignore')
+                    elif lower_name.endswith('.pdf') or 'pdf' in content_type:
+                        try:
+                            import PyPDF2  # type: ignore
+                            from io import BytesIO
+                            pdf = PyPDF2.PdfReader(BytesIO(content))
+                            parts = []
+                            for page in pdf.pages:
+                                try:
+                                    parts.append(page.extract_text() or '')
+                                except Exception:
+                                    continue
+                            cv_text = "\n".join(parts).strip()
+                        except Exception as e:
+                            return Response({
+                                "detail": f"PDF parsing failed: {e}",
+                                "hint": "Install PyPDF2 or upload a .txt file",
+                            }, status=400)
+                    elif lower_name.endswith('.docx') or 'officedocument.wordprocessingml' in content_type:
+                        try:
+                            import docx  # type: ignore
+                            from io import BytesIO
+                            doc = docx.Document(BytesIO(content))
+                            cv_text = "\n".join(p.text for p in doc.paragraphs).strip()
+                        except Exception as e:
+                            return Response({
+                                "detail": f"DOCX parsing failed: {e}",
+                                "hint": "Install python-docx or upload a .txt file",
+                            }, status=400)
+                    else:
+                        return Response({
+                            "detail": "Unsupported file type for CV",
+                            "hint": "Upload .txt, .pdf, or .docx",
+                            "received_content_type": content_type,
+                            "filename": name,
+                        }, status=400)
+                except Exception as e:
+                    return Response({"detail": f"Could not read uploaded file: {e}"}, status=400)
+
+        # Basic validation: ensure provided content resembles a CV
+        def _looks_like_cv(txt: str) -> bool:
+            try:
+                s = (txt or "").strip()
+                if len(s) < 300:
+                    return False
+                low = s.lower()
+                section_hits = 0
+                for kw in ["experience", "education", "skills", "projects", "summary", "work", "career"]:
+                    if kw in low:
+                        section_hits += 1
+                has_email = bool(re.search(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", s))
+                has_phone = bool(re.search(r"\+?\d[\d\s().-]{7,}", s))
+                return section_hits >= 2 and (has_email or has_phone)
+            except Exception:
+                return False
+
+        # Resolve SbUser (supabase) from authenticated Django user via email
+        sb_user = None
+        try:
+            auth_user = getattr(request, "user", None)
+            auth_email = getattr(auth_user, "email", None)
+            if auth_email:
+                sb_user = SbUser.objects.filter(email=auth_email).first()
+        except Exception:
+            sb_user = None
+
+        if not sb_user:
+            return Response({
+                "detail": "Associated Supabase user not found for authenticated account",
+                "hint": "Ensure a matching SbUser exists with the same email as the logged-in user",
+            }, status=404)
+        if not cv_text:
+            return Response({"detail": "cv_text or file is required"}, status=400)
+        if not _looks_like_cv(cv_text):
+            return Response({
+                "detail": "Uploaded content does not appear to be a CV",
+                "hint": "Ensure the file contains resume sections like Experience, Education, Skills and contact info",
+            }, status=415)
+
+        try:
+            # Upsert single CV per user: update if exists, else create
+            existing_cv = CV.objects.filter(user_id=sb_user.id).order_by('-created_at').first()
+            embedding_warnings = []
+            if existing_cv:
+                existing_cv.filename = filename
+                existing_cv.parsed_text = cv_text
+                existing_cv.updated_at = timezone.now()
+                existing_cv.save(update_fields=["filename", "parsed_text", "updated_at"])
+                # Remove old embeddings for this CV
+                try:
+                    with connection.cursor() as c:
+                        c.execute("DELETE FROM cv_embeddings WHERE cv_id = %s", [str(existing_cv.id)])
+                except Exception as e:
+                    embedding_warnings.append(f"cleanup: {e}")
+                target_cv = existing_cv
+                status_code = 200
+            else:
+                target_cv = CV.objects.create(
+                    user_id=sb_user.id,
+                    filename=filename,
+                    parsed_text=cv_text,
+                    created_at=timezone.now(),
+                    updated_at=timezone.now(),
+                )
+                status_code = 201
+
+            # Create embeddings for CV text (chunked)
+            chunks = chunk_text(cv_text)
+            for i, chunk in enumerate(chunks or []):
+                try:
+                    emb = embed_text(chunk)
+                    if EMB_DIM and len(emb) != EMB_DIM:
+                        embedding_warnings.append(f"chunk_{i}: unexpected dim {len(emb)}")
+                        continue
+                    with connection.cursor() as c:
+                        emb_literal = "[" + ",".join(map(str, emb)) + "]"
+                        c.execute(
+                            "INSERT INTO cv_embeddings (id, cv_id, created_at, embedding) VALUES (%s, %s, NOW(), %s::vector)",
+                            [str(uuid.uuid4()), str(target_cv.id), emb_literal],
+                        )
+                except Exception as e:
+                    embedding_warnings.append(f"chunk_{i}: {e}")
+
+            resp = {
+                "id": str(target_cv.id),
+                "user": str(target_cv.user_id),
+                "filename": target_cv.filename,
+                "parsed_text_len": len(target_cv.parsed_text or ''),
+            }
+            if embedding_warnings:
+                resp["embedding_warnings"] = embedding_warnings
+            return Response(resp, status=status_code)
+        except Exception as e:
+            return Response({"detail": str(e)}, status=400)
+
+
+class CVRecommendationsView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request):
+        """Generate recommendation metrics and suggestions for a CV.
+
+        Accepts one of:
+          - cv_id: use a stored CV
+          - cv_text: raw CV text
+          - none: use the latest CV of the authenticated user
+        """
+        cv_id = request.data.get("cv_id")
+        cv_text = request.data.get("cv_text")
+
+        # Resolve CV text
+        if cv_id and not cv_text:
+            try:
+                cv_obj = CV.objects.get(id=cv_id)
+                cv_text = cv_obj.parsed_text or ""
+            except CV.DoesNotExist:
+                return Response({"detail": "cv_id not found"}, status=404)
+
+        if not cv_id and not cv_text:
+            auth_user = getattr(request, "user", None)
+            auth_email = getattr(auth_user, "email", None)
+            sb_user = None
+            if auth_email:
+                sb_user = SbUser.objects.filter(email=auth_email).first()
+            if not sb_user:
+                return Response({
+                    "detail": "Associated Supabase user not found for authenticated account",
+                    "hint": "Ensure a matching SbUser exists with the same email as the logged-in user",
+                }, status=404)
+            latest_cv = CV.objects.filter(user_id=sb_user.id).order_by('-created_at').first()
+            if not latest_cv:
+                return Response({
+                    "detail": "No uploaded CV found for the authenticated user",
+                    "hint": "Upload a CV first using /api/rag/cv-upload/",
+                }, status=404)
+            cv_text = latest_cv.parsed_text or ""
+
+        if not cv_text:
+            return Response({"detail": "cv_text is empty"}, status=400)
+
+        text = cv_text.strip()
+
+        # Call Fireworks chat model to analyze and return structured JSON
+        if not FIREWORKS_API_KEY:
+            return Response({
+                "detail": "FIREWORKS_API_KEY is not set",
+                "hint": "Configure FIREWORKS_API_KEY in environment",
+            }, status=400)
+
+        system_prompt = (
+            "You are an expert ATS resume analyzer. "
+            "Given the raw CV text, analyze it and return STRICT JSON (no prose). "
+            "Return fields: overall_score (0-100), skills_match (0-100), experience_relevance (0-100), ats_readability (0-100), "
+            "suggestions (array of objects: {title, priority in [high, medium, low], details}), and cv_extract. "
+            "cv_extract must summarize the CV for UI display with: full_name, job_title, summary, skills (array of strings), "
+            "experience (array of {company, role, period, bullets[array of strings]}), and contact {email, phone}. "
+            "Tailor suggestions and cv_extract to the provided CV content; do NOT output placeholders or generic text. "
+            "Base everything solely on the provided CV."
+        )
+        user_prompt = (
+            "CV Text:\n" + text + "\n\n"+
+            "Output a single JSON object with the exact keys described."
+        )
+
+        try:
+            url = f"{FIREWORKS_BASE_URL}/chat/completions"
+            model_name = config("FIREWORKS_CHAT_MODEL", default="accounts/fireworks/models/llama-v3p1-70b-instruct")
+            headers = {
+                "Authorization": f"Bearer {FIREWORKS_API_KEY}",
+                "Content-Type": "application/json",
+            }
+            payload = {
+                "model": model_name,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                "temperature": 0.1,
+                "response_format": {"type": "json_object"},
+            }
+            r = requests.post(url, headers=headers, json=payload, timeout=60)
+            if not r.ok:
+                return Response({"detail": f"Fireworks error: {r.status_code}", "body": r.text}, status=400)
+            data_resp = r.json()
+            content = data_resp.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+        except Exception as e:
+            return Response({"detail": f"Model call failed: {e}"}, status=400)
+
+        def _parse_json(s: str):
+            try:
+                return json.loads(s)
+            except Exception:
+                # Attempt to extract the first JSON object
+                m = re.search(r"\{[\s\S]*\}", s)
+                if m:
+                    try:
+                        return json.loads(m.group(0))
+                    except Exception:
+                        return None
+                return None
+
+        data = _parse_json(content)
+        if not isinstance(data, dict):
+            return Response({
+                "detail": "Model returned non-JSON output",
+                "raw": content,
+            }, status=400)
+
+        # Coerce and clamp fields defensively
+        def _clamp_int(v, lo=0, hi=100):
+            try:
+                return max(lo, min(hi, int(round(float(v)))))
+            except Exception:
+                return 0
+
+        cv_extract = data.get("cv_extract") or {}
+        # Normalize cv_extract fields defensively
+        if not isinstance(cv_extract, dict):
+            cv_extract = {}
+        result = {
+            "overall_score": _clamp_int(data.get("overall_score")),
+            "skills_match": _clamp_int(data.get("skills_match")),
+            "experience_relevance": _clamp_int(data.get("experience_relevance")),
+            "ats_readability": _clamp_int(data.get("ats_readability")),
+            "suggestions": data.get("suggestions") or [],
+            "cv_extract": {
+                "full_name": cv_extract.get("full_name"),
+                "job_title": cv_extract.get("job_title"),
+                "summary": cv_extract.get("summary"),
+                "skills": cv_extract.get("skills") or [],
+                "experience": cv_extract.get("experience") or [],
+                "contact": cv_extract.get("contact") or {},
+            },
+            "analyzed_chars": len(text),
+        }
+        return Response(result, status=200)
+
+
+class DashboardView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        try:
+            # Resolve authenticated supabase user
+            auth_user = getattr(request, "user", None)
+            auth_email = getattr(auth_user, "email", None)
+            sb_user = None
+            if auth_email:
+                sb_user = SbUser.objects.filter(email=auth_email).first()
+            if not sb_user:
+                return Response({
+                    "detail": "Associated Supabase user not found for authenticated account",
+                    "hint": "Ensure a matching SbUser exists with the same email as the logged-in user",
+                }, status=404)
+
+            latest_cv = CV.objects.filter(user_id=sb_user.id).order_by('-created_at').first()
+            cv_text = (latest_cv.parsed_text if latest_cv else None) or ""
+
+            # Compute top matches using the CV (if present)
+            top_matches = []
+            total_matches = 0
+            if cv_text:
+                chunks = chunk_text(cv_text)
+                emb_list = []
+                for ch in chunks:
+                    try:
+                        emb_list.append(embed_text(ch))
+                    except Exception:
+                        continue
+                # Aggregate by job with best score across chunks
+                job_id_to_best = {}
+                for vec in emb_list:
+                    if not vec:
+                        continue
+                    rows = search_similar_jobs(vec, top_n=50, similarity_threshold=0.0)
+                    for row in rows or []:
+                        try:
+                            if not row or len(row) < 6:
+                                continue
+                            score_idx = 6 if len(row) >= 7 else 5
+                            score_val = row[score_idx]
+                            if score_val is None:
+                                continue
+                            job_id = str(row[0])
+                            score_f = float(score_val)
+                            existing = job_id_to_best.get(job_id)
+                            if existing is None or score_f > existing.get("score", 0.0):
+                                job_obj = {
+                                    "id": job_id,
+                                    "title": row[1],
+                                    "description": row[2],
+                                    "requirements": row[3],
+                                    "company": str(row[4]) if row[4] is not None else None,
+                                    "score": score_f,
+                                }
+                                job_id_to_best[job_id] = job_obj
+                        except Exception:
+                            continue
+                matches = list(job_id_to_best.values())
+                matches.sort(key=lambda x: x.get("score", 0.0), reverse=True)
+                total_matches = len(matches)
+                top_matches = [{
+                    "id": m.get("id"),
+                    "title": m.get("title"),
+                    "company": m.get("company"),
+                    "score": round(float(m.get("score", 0.0)) * 100),
+                } for m in matches[:3]]
+
+            # Get AI-driven CV score via Fireworks (reuse the same model setup)
+            cv_score_value = None
+            if cv_text:
+                system_prompt = (
+                    "You are an expert ATS resume analyzer. Return STRICT JSON with one key: overall_score (0-100)."
+                )
+                user_prompt = "CV Text:\n" + cv_text + "\n\nOutput: {\"overall_score\": 87}"
+                if not FIREWORKS_API_KEY:
+                    cv_score_value = None
+                else:
+                    try:
+                        url = f"{FIREWORKS_BASE_URL}/chat/completions"
+                        model_name = config("FIREWORKS_CHAT_MODEL", default="accounts/fireworks/models/llama-v3p1-70b-instruct")
+                        headers = {
+                            "Authorization": f"Bearer {FIREWORKS_API_KEY}",
+                            "Content-Type": "application/json",
+                        }
+                        payload = {
+                            "model": model_name,
+                            "messages": [
+                                {"role": "system", "content": system_prompt},
+                                {"role": "user", "content": user_prompt},
+                            ],
+                            "temperature": 0.1,
+                            "response_format": {"type": "json_object"},
+                        }
+                        r = requests.post(url, headers=headers, json=payload, timeout=45)
+                        if r.ok:
+                            data_resp = r.json()
+                            content = data_resp.get("choices", [{}])[0].get("message", {}).get("content", "")
+                            try:
+                                obj = json.loads(content)
+                                v = obj.get("overall_score")
+                                if isinstance(v, (int, float)):
+                                    cv_score_value = int(round(float(v)))
+                            except Exception:
+                                cv_score_value = None
+                    except Exception:
+                        cv_score_value = None
+
+            resp = {
+                "job_matches": {"count": total_matches},
+                "cv_score": {"value": cv_score_value},
+                "profile_views": {"value": 0},
+                "top_matches": top_matches,
+            }
+            return Response(resp, status=200)
         except Exception as e:
             return Response({"detail": str(e)}, status=400)

@@ -909,3 +909,131 @@ class DashboardView(APIView):
             return Response(resp, status=200)
         except Exception as e:
             return Response({"detail": str(e)}, status=400)
+
+
+class CareerAdvisorView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request):
+        """AI Career Advisor: Analyze CV and provide career path guidance.
+
+        Accepts one of:
+          - cv_id: use a stored CV
+          - cv_text: raw CV text
+          - none: use the latest CV of the authenticated user
+        """
+        cv_id = request.data.get("cv_id")
+        cv_text = request.data.get("cv_text")
+
+        # Resolve CV text (same logic as recommendations)
+        if cv_id and not cv_text:
+            try:
+                cv_obj = CV.objects.get(id=cv_id)
+                cv_text = cv_obj.parsed_text or ""
+            except CV.DoesNotExist:
+                return Response({"detail": "cv_id not found"}, status=404)
+
+        if not cv_id and not cv_text:
+            auth_user = getattr(request, "user", None)
+            auth_email = getattr(auth_user, "email", None)
+            sb_user = None
+            if auth_email:
+                sb_user = SbUser.objects.filter(email=auth_email).first()
+            if not sb_user:
+                return Response({
+                    "detail": "Associated Supabase user not found for authenticated account",
+                    "hint": "Ensure a matching SbUser exists with the same email as the logged-in user",
+                }, status=404)
+            latest_cv = CV.objects.filter(user_id=sb_user.id).order_by('-created_at').first()
+            if not latest_cv:
+                return Response({
+                    "detail": "No uploaded CV found for the authenticated user",
+                    "hint": "Upload a CV first using /api/rag/cv-upload/",
+                }, status=404)
+            cv_text = latest_cv.parsed_text or ""
+
+        if not cv_text:
+            return Response({"detail": "cv_text is empty"}, status=400)
+
+        text = cv_text.strip()
+
+        # Call Fireworks for career guidance
+        if not FIREWORKS_API_KEY:
+            return Response({
+                "detail": "FIREWORKS_API_KEY is not set",
+                "hint": "Configure FIREWORKS_API_KEY in environment",
+            }, status=400)
+
+        system_prompt = (
+            "You are an expert career advisor and talent acquisition specialist. "
+            "Analyze the provided CV and return STRICT JSON with career guidance. "
+            "Return fields: current_role_assessment, career_paths (array of objects with title, description, transition_difficulty, growth_potential), "
+            "skills_gaps (array of strings), market_demand (array of objects with role, demand_level, salary_range), "
+            "recommendations (array of strings), and next_steps (array of strings). "
+            "Base all advice on the actual CV content; be specific and actionable."
+        )
+        user_prompt = (
+            "CV Text:\n" + text + "\n\n" +
+            "Provide career guidance in this JSON format:\n" +
+            '{"current_role_assessment": "Brief assessment of current position", '
+            '"career_paths": [{"title": "Data Scientist", "description": "Transition to advanced analytics", "transition_difficulty": "medium", "growth_potential": "high"}], '
+            '"skills_gaps": ["Python", "Machine Learning"], '
+            '"market_demand": [{"role": "Data Analyst", "demand_level": "high", "salary_range": "$60k-90k"}], '
+            '"recommendations": ["Learn Python programming", "Get certified in data analysis"], '
+            '"next_steps": ["Update LinkedIn profile", "Apply to 5 data analyst positions"]}'
+        )
+
+        try:
+            url = f"{FIREWORKS_BASE_URL}/chat/completions"
+            model_name = config("FIREWORKS_CHAT_MODEL", default="accounts/fireworks/models/llama-v3p1-70b-instruct")
+            headers = {
+                "Authorization": f"Bearer {FIREWORKS_API_KEY}",
+                "Content-Type": "application/json",
+            }
+            payload = {
+                "model": model_name,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                "temperature": 0.3,
+                "response_format": {"type": "json_object"},
+            }
+            r = requests.post(url, headers=headers, json=payload, timeout=60)
+            if not r.ok:
+                return Response({"detail": f"Fireworks error: {r.status_code}", "body": r.text}, status=400)
+            data_resp = r.json()
+            content = data_resp.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+        except Exception as e:
+            return Response({"detail": f"Model call failed: {e}"}, status=400)
+
+        def _parse_json(s: str):
+            try:
+                return json.loads(s)
+            except Exception:
+                m = re.search(r"\{[\s\S]*\}", s)
+                if m:
+                    try:
+                        return json.loads(m.group(0))
+                    except Exception:
+                        return None
+                return None
+
+        data = _parse_json(content)
+        if not isinstance(data, dict):
+            return Response({
+                "detail": "Model returned non-JSON output",
+                "raw": content,
+            }, status=400)
+
+        # Normalize response defensively
+        result = {
+            "current_role_assessment": data.get("current_role_assessment", ""),
+            "career_paths": data.get("career_paths") or [],
+            "skills_gaps": data.get("skills_gaps") or [],
+            "market_demand": data.get("market_demand") or [],
+            "recommendations": data.get("recommendations") or [],
+            "next_steps": data.get("next_steps") or [],
+            "analyzed_chars": len(text),
+        }
+        return Response(result, status=200)

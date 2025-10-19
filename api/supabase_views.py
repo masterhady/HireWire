@@ -1037,3 +1037,263 @@ class CareerAdvisorView(APIView):
             "analyzed_chars": len(text),
         }
         return Response(result, status=200)
+
+
+class InterviewQuestionsView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request):
+        """Generate AI-powered interview questions based on CV and target job.
+
+        Body:
+          - cv_id (optional): use stored CV
+          - cv_text (optional): raw CV text
+          - job_description (required): target job description
+          - question_count (optional): number of questions (default 10)
+          - difficulty (optional): easy/medium/hard (default medium)
+        """
+        cv_id = request.data.get("cv_id")
+        cv_text = request.data.get("cv_text")
+        job_description = request.data.get("job_description")
+        question_count = int(request.data.get("question_count", 10))
+        difficulty = request.data.get("difficulty", "medium")
+
+        if not job_description:
+            return Response({"detail": "job_description is required"}, status=400)
+
+        # Resolve CV text (same logic as other endpoints)
+        if cv_id and not cv_text:
+            try:
+                cv_obj = CV.objects.get(id=cv_id)
+                cv_text = cv_obj.parsed_text or ""
+            except CV.DoesNotExist:
+                return Response({"detail": "cv_id not found"}, status=404)
+
+        if not cv_id and not cv_text:
+            auth_user = getattr(request, "user", None)
+            auth_email = getattr(auth_user, "email", None)
+            sb_user = None
+            if auth_email:
+                sb_user = SbUser.objects.filter(email=auth_email).first()
+            if not sb_user:
+                return Response({
+                    "detail": "Associated Supabase user not found for authenticated account",
+                    "hint": "Ensure a matching SbUser exists with the same email as the logged-in user",
+                }, status=404)
+            latest_cv = CV.objects.filter(user_id=sb_user.id).order_by('-created_at').first()
+            if not latest_cv:
+                return Response({
+                    "detail": "No uploaded CV found for the authenticated user",
+                    "hint": "Upload a CV first using /api/rag/cv-upload/",
+                }, status=404)
+            cv_text = latest_cv.parsed_text or ""
+
+        if not cv_text:
+            return Response({"detail": "cv_text is empty"}, status=400)
+
+        # Call Fireworks for interview questions
+        if not FIREWORKS_API_KEY:
+            return Response({
+                "detail": "FIREWORKS_API_KEY is not set",
+                "hint": "Configure FIREWORKS_API_KEY in environment",
+            }, status=400)
+
+        system_prompt = (
+            "You are an expert interview coach and hiring manager. "
+            "Generate personalized interview questions based on the candidate's CV and target job description. "
+            "Return STRICT JSON with questions array. Each question should have: question, category, difficulty, tips, and expected_answer_focus. "
+            "Base questions on the actual CV content and job requirements; make them specific and relevant."
+        )
+        user_prompt = (
+            f"Candidate CV:\n{cv_text}\n\n"
+            f"Target Job Description:\n{job_description}\n\n"
+            f"Generate {question_count} {difficulty} difficulty interview questions in this JSON format:\n"
+            '{"questions": [{"question": "Tell me about a challenging project you worked on", "category": "behavioral", "difficulty": "medium", "tips": "Use STAR method", "expected_answer_focus": "problem-solving and leadership"}]}'
+        )
+
+        try:
+            url = f"{FIREWORKS_BASE_URL}/chat/completions"
+            model_name = config("FIREWORKS_CHAT_MODEL", default="accounts/fireworks/models/llama-v3p1-70b-instruct")
+            headers = {
+                "Authorization": f"Bearer {FIREWORKS_API_KEY}",
+                "Content-Type": "application/json",
+            }
+            payload = {
+                "model": model_name,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                "temperature": 0.4,
+                "response_format": {"type": "json_object"},
+            }
+            r = requests.post(url, headers=headers, json=payload, timeout=60)
+            if not r.ok:
+                return Response({"detail": f"Fireworks error: {r.status_code}", "body": r.text}, status=400)
+            data_resp = r.json()
+            content = data_resp.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+        except Exception as e:
+            return Response({"detail": f"Model call failed: {e}"}, status=400)
+
+        def _parse_json(s: str):
+            try:
+                return json.loads(s)
+            except Exception:
+                m = re.search(r"\{[\s\S]*\}", s)
+                if m:
+                    try:
+                        return json.loads(m.group(0))
+                    except Exception:
+                        return None
+                return None
+
+        data = _parse_json(content)
+        if not isinstance(data, dict):
+            return Response({
+                "detail": "Model returned non-JSON output",
+                "raw": content,
+            }, status=400)
+
+        result = {
+            "questions": data.get("questions") or [],
+            "job_description": job_description,
+            "difficulty": difficulty,
+            "question_count": len(data.get("questions") or []),
+        }
+        return Response(result, status=200)
+
+
+class InterviewPracticeView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request):
+        """Chat-style interview practice with AI interviewer.
+
+        Body:
+          - question (required): the interview question
+          - answer (required): candidate's answer
+          - cv_id (optional): for context
+          - cv_text (optional): for context
+          - job_description (optional): for context
+        """
+        question = request.data.get("question")
+        answer = request.data.get("answer")
+        cv_id = request.data.get("cv_id")
+        cv_text = request.data.get("cv_text")
+        job_description = request.data.get("job_description", "")
+
+        if not question or not answer:
+            return Response({"detail": "question and answer are required"}, status=400)
+
+        # Resolve CV text for context
+        if cv_id and not cv_text:
+            try:
+                cv_obj = CV.objects.get(id=cv_id)
+                cv_text = cv_obj.parsed_text or ""
+            except CV.DoesNotExist:
+                cv_text = ""
+
+        if not cv_id and not cv_text:
+            auth_user = getattr(request, "user", None)
+            auth_email = getattr(auth_user, "email", None)
+            sb_user = None
+            if auth_email:
+                sb_user = SbUser.objects.filter(email=auth_email).first()
+            if sb_user:
+                latest_cv = CV.objects.filter(user_id=sb_user.id).order_by('-created_at').first()
+                if latest_cv:
+                    cv_text = latest_cv.parsed_text or ""
+
+        # Call Fireworks for interview feedback
+        if not FIREWORKS_API_KEY:
+            return Response({
+                "detail": "FIREWORKS_API_KEY is not set",
+                "hint": "Configure FIREWORKS_API_KEY in environment",
+            }, status=400)
+
+        system_prompt = (
+            "You are an expert interview coach providing constructive feedback. "
+            "Analyze the candidate's answer and return STRICT JSON with: "
+            "overall_score (0-100), strengths (array), areas_for_improvement (array), "
+            "follow_up_question (string), and detailed_feedback (string). "
+            "Be encouraging but honest in your assessment."
+        )
+        
+        context_parts = []
+        if cv_text:
+            context_parts.append(f"Candidate Background:\n{cv_text}")
+        if job_description:
+            context_parts.append(f"Job Context:\n{job_description}")
+        context = "\n\n".join(context_parts)
+
+        user_prompt = (
+            f"{context}\n\n"
+            f"Interview Question: {question}\n\n"
+            f"Candidate's Answer: {answer}\n\n"
+            "Provide feedback in this JSON format:\n"
+            '{"overall_score": 75, "strengths": ["Good use of examples", "Clear communication"], '
+            '"areas_for_improvement": ["Could be more specific", "Missing quantifiable results"], '
+            '"follow_up_question": "Can you elaborate on the specific challenges you faced?", '
+            '"detailed_feedback": "Your answer shows good understanding but could benefit from more specific details..."}'
+        )
+
+        try:
+            url = f"{FIREWORKS_BASE_URL}/chat/completions"
+            model_name = config("FIREWORKS_CHAT_MODEL", default="accounts/fireworks/models/llama-v3p1-70b-instruct")
+            headers = {
+                "Authorization": f"Bearer {FIREWORKS_API_KEY}",
+                "Content-Type": "application/json",
+            }
+            payload = {
+                "model": model_name,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                "temperature": 0.3,
+                "response_format": {"type": "json_object"},
+            }
+            r = requests.post(url, headers=headers, json=payload, timeout=60)
+            if not r.ok:
+                return Response({"detail": f"Fireworks error: {r.status_code}", "body": r.text}, status=400)
+            data_resp = r.json()
+            content = data_resp.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+        except Exception as e:
+            return Response({"detail": f"Model call failed: {e}"}, status=400)
+
+        def _parse_json(s: str):
+            try:
+                return json.loads(s)
+            except Exception:
+                m = re.search(r"\{[\s\S]*\}", s)
+                if m:
+                    try:
+                        return json.loads(m.group(0))
+                    except Exception:
+                        return None
+                return None
+
+        data = _parse_json(content)
+        if not isinstance(data, dict):
+            return Response({
+                "detail": "Model returned non-JSON output",
+                "raw": content,
+            }, status=400)
+
+        # Normalize response defensively
+        def _clamp_score(v):
+            try:
+                return max(0, min(100, int(round(float(v)))))
+            except Exception:
+                return 0
+
+        result = {
+            "overall_score": _clamp_score(data.get("overall_score", 0)),
+            "strengths": data.get("strengths") or [],
+            "areas_for_improvement": data.get("areas_for_improvement") or [],
+            "follow_up_question": data.get("follow_up_question", ""),
+            "detailed_feedback": data.get("detailed_feedback", ""),
+            "question": question,
+            "answer": answer,
+        }
+        return Response(result, status=200)

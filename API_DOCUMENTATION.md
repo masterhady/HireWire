@@ -887,3 +887,150 @@ curl -X POST http://localhost:8080/api/career-advisor/ \
   ]
 }
 ```
+
+---
+
+### Interview Questions Generator (New)
+**POST** `/interview/questions/`
+
+**Description:** Generate personalized interview questions based on the user's CV and target job description using AI.
+
+**Authentication:** Required
+
+**Request Body:**
+```json
+{
+  "job_description": "string (required)",
+  "cv_id": "uuid (optional)",
+  "cv_text": "string (optional)",
+  "question_count": 10,
+  "difficulty": "medium"
+}
+```
+
+**Response Fields:**
+- `questions`: Array of question objects with question, category, difficulty, tips, expected_answer_focus
+- `job_description`: The target job description
+- `difficulty`: Selected difficulty level
+- `question_count`: Number of questions generated
+
+**Examples:**
+```bash
+# Generate questions for a specific job
+curl -X POST http://localhost:8080/api/interview/questions/ \
+  -H "Authorization: Bearer <access_token>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "job_description": "Senior Frontend Developer with React, TypeScript, and 5+ years experience...",
+    "question_count": 15,
+    "difficulty": "hard"
+  }'
+
+# Use specific CV
+curl -X POST http://localhost:8080/api/interview/questions/ \
+  -H "Authorization: Bearer <access_token>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "job_description": "Data Scientist position...",
+    "cv_id": "<cv_uuid>",
+    "difficulty": "medium"
+  }'
+```
+
+**Example Response:**
+```json
+{
+  "questions": [
+    {
+      "question": "Tell me about a challenging React project you worked on and how you solved performance issues",
+      "category": "technical",
+      "difficulty": "hard",
+      "tips": "Focus on specific metrics and optimization techniques",
+      "expected_answer_focus": "problem-solving, technical depth, and measurable results"
+    },
+    {
+      "question": "How do you handle state management in large React applications?",
+      "category": "technical",
+      "difficulty": "medium",
+      "tips": "Discuss Redux, Context API, or other state management solutions",
+      "expected_answer_focus": "architecture decisions and scalability considerations"
+    }
+  ],
+  "job_description": "Senior Frontend Developer...",
+  "difficulty": "hard",
+  "question_count": 2
+}
+```
+
+---
+
+### Interview Practice Chat (New)
+**POST** `/interview/practice/`
+
+**Description:** Chat-style interview practice where users can submit answers and receive AI feedback with scores and suggestions.
+
+**Authentication:** Required
+
+**Request Body:**
+```json
+{
+  "question": "string (required)",
+  "answer": "string (required)",
+  "cv_id": "uuid (optional)",
+  "cv_text": "string (optional)",
+  "job_description": "string (optional)"
+}
+```
+
+**Response Fields:**
+- `overall_score`: Score from 0-100
+- `strengths`: Array of positive aspects
+- `areas_for_improvement`: Array of areas to work on
+- `follow_up_question`: Suggested follow-up question
+- `detailed_feedback`: Comprehensive feedback text
+- `question`: The original question
+- `answer`: The submitted answer
+
+**Examples:**
+```bash
+# Practice with feedback
+curl -X POST http://localhost:8080/api/interview/practice/ \
+  -H "Authorization: Bearer <access_token>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "question": "Tell me about a challenging project you worked on",
+    "answer": "I worked on a React application that had performance issues. I optimized the bundle size and implemented code splitting...",
+    "job_description": "Senior Frontend Developer role..."
+  }'
+
+# Practice with CV context
+curl -X POST http://localhost:8080/api/interview/practice/ \
+  -H "Authorization: Bearer <access_token>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "question": "What is your experience with TypeScript?",
+    "answer": "I have been using TypeScript for 2 years...",
+    "cv_id": "<cv_uuid>"
+  }'
+```
+
+**Example Response:**
+```json
+{
+  "overall_score": 78,
+  "strengths": [
+    "Good use of specific technical details",
+    "Clear explanation of the problem and solution",
+    "Mentioned measurable improvements"
+  ],
+  "areas_for_improvement": [
+    "Could include more details about team collaboration",
+    "Missing information about lessons learned",
+    "Consider adding quantifiable business impact"
+  ],
+  "follow_up_question": "What specific metrics did you use to measure the performance improvements?",
+  "detailed_feedback": "Your answer demonstrates strong technical knowledge and problem-solving skills. The explanation of code splitting and bundle optimization shows deep understanding. To strengthen your response, consider adding more context about team dynamics and the broader business impact of your work.",
+  "question": "Tell me about a challenging project you worked on",
+  "answer": "I worked on a React application that had performance issues..."
+}
+```

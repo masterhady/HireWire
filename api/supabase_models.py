@@ -18,7 +18,7 @@ class SbCompany(models.Model):
 class SbUser(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     role = models.TextField()
-    company = models.ForeignKey(SbCompany, models.DO_NOTHING, db_column="company_id", blank=True, null=True)
+    company = models.ForeignKey(settings.AUTH_USER_MODEL, models.DO_NOTHING, db_column="company_id", blank=True, null=True)
     full_name = models.TextField()
     email = models.TextField(unique=False)
     password_hash = models.TextField()

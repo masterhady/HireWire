@@ -804,3 +804,86 @@ curl -X POST http://localhost:8080/api/rag/cv-recommendations/ \
 curl -X GET http://localhost:8080/api/dashboard/ \
   -H "Authorization: Bearer <access_token>"
 ```
+
+---
+
+### Career Advisor AI Agent (New)
+**POST** `/career-advisor/`
+
+**Description:** AI-powered career guidance that analyzes the user's CV and provides personalized career path recommendations, skills gaps, market demand insights, and actionable next steps.
+
+**Authentication:** Required
+
+**Request Body:**
+```json
+{
+  "cv_id": "uuid (optional)",
+  "cv_text": "string (optional)"
+}
+```
+
+**Response Fields:**
+- `current_role_assessment`: Brief assessment of current position
+- `career_paths`: Array of career options with title, description, transition_difficulty, growth_potential
+- `skills_gaps`: Array of missing skills to develop
+- `market_demand`: Array of roles with demand_level and salary_range
+- `recommendations`: Array of specific improvement suggestions
+- `next_steps`: Array of actionable next steps
+
+**Examples:**
+```bash
+# Use latest uploaded CV automatically
+curl -X POST http://localhost:8080/api/career-advisor/ \
+  -H "Authorization: Bearer <access_token>"
+
+# Use specific stored CV
+curl -X POST http://localhost:8080/api/career-advisor/ \
+  -H "Authorization: Bearer <access_token>" \
+  -H "Content-Type: application/json" \
+  -d '{"cv_id":"<cv_uuid>"}'
+
+# Analyze raw text
+curl -X POST http://localhost:8080/api/career-advisor/ \
+  -H "Authorization: Bearer <access_token>" \
+  -H "Content-Type: application/json" \
+  -d '{"cv_text":"..."}'
+```
+
+**Example Response:**
+```json
+{
+  "current_role_assessment": "Experienced frontend developer with strong React skills",
+  "career_paths": [
+    {
+      "title": "Senior Frontend Architect",
+      "description": "Lead technical decisions and mentor junior developers",
+      "transition_difficulty": "low",
+      "growth_potential": "high"
+    },
+    {
+      "title": "Full Stack Developer",
+      "description": "Expand into backend development with Node.js/Python",
+      "transition_difficulty": "medium",
+      "growth_potential": "high"
+    }
+  ],
+  "skills_gaps": ["TypeScript", "GraphQL", "Docker"],
+  "market_demand": [
+    {
+      "role": "Senior Frontend Developer",
+      "demand_level": "high",
+      "salary_range": "$80k-120k"
+    }
+  ],
+  "recommendations": [
+    "Learn TypeScript for better code quality",
+    "Get certified in cloud platforms (AWS/Azure)",
+    "Build a portfolio with full-stack projects"
+  ],
+  "next_steps": [
+    "Update LinkedIn with new skills",
+    "Apply to 10 senior frontend positions",
+    "Start learning TypeScript this month"
+  ]
+}
+```

@@ -22,6 +22,10 @@ from .supabase_views import (
     CareerAdvisorView,
     InterviewQuestionsView,
     InterviewPracticeView,
+    InterviewAnswerEvaluationView,
+    InterviewAnswerSubmissionView,
+    InterviewHistoryView,
+    InterviewProgressView,
 )
 
 router = DefaultRouter()
@@ -48,5 +52,9 @@ urlpatterns = [
     path("career-advisor/", CareerAdvisorView.as_view(), name="career_advisor"),
     path("interview/questions/", InterviewQuestionsView.as_view(), name="interview_questions"),
     path("interview/practice/", InterviewPracticeView.as_view(), name="interview_practice"),
+    path("interview/evaluate/", InterviewAnswerEvaluationView.as_view(), name="interview_evaluate"),
+    path("interview/submit-answer/", InterviewAnswerSubmissionView.as_view(), name="interview_submit_answer"),
+    path("interview/history/", InterviewHistoryView.as_view(), name="interview_history"),
+    path("interview/progress/", InterviewProgressView.as_view(), name="interview_progress"),
     path("", include(router.urls)),
 ]

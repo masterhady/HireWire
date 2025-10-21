@@ -9,6 +9,10 @@ from .supabase_models import (
     JobEmbedding,
     Application,
     Recommendation,
+    InterviewSession,
+    InterviewQuestion,
+    InterviewAnswer,
+    InterviewEvaluation,
 )
 
 
@@ -65,4 +69,28 @@ class ApplicationSerializer(serializers.ModelSerializer):
 class RecommendationSerializer(serializers.ModelSerializer):
     class Meta:
         model = Recommendation
+        fields = "__all__"
+
+
+class InterviewSessionSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = InterviewSession
+        fields = "__all__"
+
+
+class InterviewQuestionSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = InterviewQuestion
+        fields = "__all__"
+
+
+class InterviewAnswerSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = InterviewAnswer
+        fields = "__all__"
+
+
+class InterviewEvaluationSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = InterviewEvaluation
         fields = "__all__" 

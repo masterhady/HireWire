@@ -16,6 +16,10 @@ from .supabase_models import (
     JobEmbedding,
     Application,
     Recommendation,
+    InterviewSession,
+    InterviewQuestion,
+    InterviewAnswer,
+    InterviewEvaluation,
 )
 from .supabase_serializers import (
     CompanySerializer,
@@ -27,6 +31,10 @@ from .supabase_serializers import (
     JobEmbeddingSerializer,
     ApplicationSerializer,
     RecommendationSerializer,
+    InterviewSessionSerializer,
+    InterviewQuestionSerializer,
+    InterviewAnswerSerializer,
+    InterviewEvaluationSerializer,
 )
 from .rag import (
     embed_text,
@@ -1154,13 +1162,48 @@ class InterviewQuestionsView(APIView):
                 "raw": content,
             }, status=400)
 
-        result = {
-            "questions": data.get("questions") or [],
-            "job_description": job_description,
-            "difficulty": difficulty,
-            "question_count": len(data.get("questions") or []),
-        }
-        return Response(result, status=200)
+        # Store interview session and questions
+        try:
+            # Create interview session
+            session = InterviewSession.objects.create(
+                user_id=sb_user.id,
+                job_description=job_description,
+                difficulty=difficulty,
+                created_at=timezone.now(),
+            )
+            
+            # Store each question
+            stored_questions = []
+            for q in data.get("questions") or []:
+                question_obj = InterviewQuestion.objects.create(
+                    session_id=session.id,
+                    question=q.get("question", ""),
+                    category=q.get("category", ""),
+                    difficulty=q.get("difficulty", difficulty),
+                    tips=q.get("tips", ""),
+                    expected_answer_focus=q.get("expected_answer_focus", ""),
+                    created_at=timezone.now(),
+                )
+                stored_questions.append({
+                    "id": str(question_obj.id),
+                    "question": question_obj.question,
+                    "category": question_obj.category,
+                    "difficulty": question_obj.difficulty,
+                    "tips": question_obj.tips,
+                    "expected_answer_focus": question_obj.expected_answer_focus,
+                })
+            
+            result = {
+                "session_id": str(session.id),
+                "questions": stored_questions,
+                "job_description": job_description,
+                "difficulty": difficulty,
+                "question_count": len(stored_questions),
+            }
+            return Response(result, status=200)
+            
+        except Exception as e:
+            return Response({"detail": f"Failed to store interview session: {str(e)}"}, status=400)
 
 
 class InterviewPracticeView(APIView):
@@ -1297,3 +1340,387 @@ class InterviewPracticeView(APIView):
             "answer": answer,
         }
         return Response(result, status=200)
+
+
+class InterviewAnswerEvaluationView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request):
+        """Evaluate user's answer to interview question and provide correct answer.
+
+        Body:
+          - question (required): the interview question
+          - user_answer (required): user's answer
+          - cv_id (optional): for context
+          - cv_text (optional): for context
+          - job_description (optional): for context
+        """
+        question = request.data.get("question")
+        user_answer = request.data.get("user_answer")
+        cv_id = request.data.get("cv_id")
+        cv_text = request.data.get("cv_text")
+        job_description = request.data.get("job_description", "")
+
+        if not question or not user_answer:
+            return Response({"detail": "question and user_answer are required"}, status=400)
+
+        # Resolve CV text for context
+        if cv_id and not cv_text:
+            try:
+                cv_obj = CV.objects.get(id=cv_id)
+                cv_text = cv_obj.parsed_text or ""
+            except CV.DoesNotExist:
+                cv_text = ""
+
+        if not cv_id and not cv_text:
+            auth_user = getattr(request, "user", None)
+            auth_email = getattr(auth_user, "email", None)
+            sb_user = None
+            if auth_email:
+                sb_user = SbUser.objects.filter(email=auth_email).first()
+            if sb_user:
+                latest_cv = CV.objects.filter(user_id=sb_user.id).order_by('-created_at').first()
+                if latest_cv:
+                    cv_text = latest_cv.parsed_text or ""
+
+        # Call Fireworks for answer evaluation and correct answer
+        if not FIREWORKS_API_KEY:
+            return Response({
+                "detail": "FIREWORKS_API_KEY is not set",
+                "hint": "Configure FIREWORKS_API_KEY in environment",
+            }, status=400)
+
+        system_prompt = (
+            "You are an expert interview coach and hiring manager. "
+            "Evaluate the candidate's answer and provide the correct/ideal answer. "
+            "Return STRICT JSON with: "
+            "overall_score (0-100), strengths (array), weaknesses (array), "
+            "correct_answer (string), answer_analysis (string), "
+            "improvement_tips (array), and follow_up_questions (array). "
+            "Be constructive and educational in your feedback."
+        )
+        
+        context_parts = []
+        if cv_text:
+            context_parts.append(f"Candidate Background:\n{cv_text}")
+        if job_description:
+            context_parts.append(f"Job Context:\n{job_description}")
+        context = "\n\n".join(context_parts)
+
+        user_prompt = (
+            f"{context}\n\n"
+            f"Interview Question: {question}\n\n"
+            f"Candidate's Answer: {user_answer}\n\n"
+            "Evaluate the answer and provide feedback in this JSON format:\n"
+            '{"overall_score": 75, "strengths": ["Good technical knowledge", "Clear communication"], '
+            '"weaknesses": ["Missing specific examples", "Could be more detailed"], '
+            '"correct_answer": "The ideal answer would include...", '
+            '"answer_analysis": "Your answer shows understanding but...", '
+            '"improvement_tips": ["Use STAR method", "Include specific metrics"], '
+            '"follow_up_questions": ["Can you elaborate on...", "What challenges did you face?"]}'
+        )
+
+        try:
+            url = f"{FIREWORKS_BASE_URL}/chat/completions"
+            model_name = config("FIREWORKS_CHAT_MODEL", default="accounts/fireworks/models/llama-v3p1-70b-instruct")
+            headers = {
+                "Authorization": f"Bearer {FIREWORKS_API_KEY}",
+                "Content-Type": "application/json",
+            }
+            payload = {
+                "model": model_name,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                "temperature": 0.3,
+                "response_format": {"type": "json_object"},
+            }
+            r = requests.post(url, headers=headers, json=payload, timeout=60)
+            if not r.ok:
+                return Response({"detail": f"Fireworks error: {r.status_code}", "body": r.text}, status=400)
+            data_resp = r.json()
+            content = data_resp.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+        except Exception as e:
+            return Response({"detail": f"Model call failed: {e}"}, status=400)
+
+        def _parse_json(s: str):
+            try:
+                return json.loads(s)
+            except Exception:
+                m = re.search(r"\{[\s\S]*\}", s)
+                if m:
+                    try:
+                        return json.loads(m.group(0))
+                    except Exception:
+                        return None
+                return None
+
+        data = _parse_json(content)
+        if not isinstance(data, dict):
+            return Response({
+                "detail": "Model returned non-JSON output",
+                "raw": content,
+            }, status=400)
+
+        # Normalize response defensively
+        def _clamp_score(v):
+            try:
+                return max(0, min(100, int(round(float(v)))))
+            except Exception:
+                return 0
+
+        # Store evaluation results
+        try:
+            # Get the answer record (assuming answer_id is provided)
+            answer_id = request.data.get("answer_id")
+            if answer_id:
+                try:
+                    answer = InterviewAnswer.objects.get(id=answer_id)
+                except InterviewAnswer.DoesNotExist:
+                    return Response({"detail": "Answer not found"}, status=404)
+            else:
+                # Create answer record if not provided
+                answer = InterviewAnswer.objects.create(
+                    question_id=None,  # Will be set if question_id is provided
+                    user_answer=user_answer,
+                    submitted_at=timezone.now(),
+                )
+            
+            # Store evaluation
+            evaluation = InterviewEvaluation.objects.create(
+                answer_id=answer.id,
+                overall_score=_clamp_score(data.get("overall_score", 0)),
+                strengths=data.get("strengths") or [],
+                weaknesses=data.get("weaknesses") or [],
+                correct_answer=data.get("correct_answer", ""),
+                answer_analysis=data.get("answer_analysis", ""),
+                improvement_tips=data.get("improvement_tips") or [],
+                follow_up_questions=data.get("follow_up_questions") or [],
+                evaluated_at=timezone.now(),
+            )
+            
+            result = {
+                "evaluation_id": str(evaluation.id),
+                "overall_score": evaluation.overall_score,
+                "strengths": evaluation.strengths,
+                "weaknesses": evaluation.weaknesses,
+                "correct_answer": evaluation.correct_answer,
+                "answer_analysis": evaluation.answer_analysis,
+                "improvement_tips": evaluation.improvement_tips,
+                "follow_up_questions": evaluation.follow_up_questions,
+                "question": question,
+                "user_answer": user_answer,
+            }
+            return Response(result, status=200)
+            
+        except Exception as e:
+            return Response({"detail": f"Failed to store evaluation: {str(e)}"}, status=400)
+
+
+class InterviewAnswerSubmissionView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request):
+        """Submit user's answer to an interview question.
+
+        Body:
+          - question_id (required): UUID of the interview question
+          - user_answer (required): user's answer text
+        """
+        question_id = request.data.get("question_id")
+        user_answer = request.data.get("user_answer")
+
+        if not question_id or not user_answer:
+            return Response({"detail": "question_id and user_answer are required"}, status=400)
+
+        try:
+            # Verify question exists
+            question = InterviewQuestion.objects.get(id=question_id)
+            
+            # Store the answer
+            answer = InterviewAnswer.objects.create(
+                question_id=question_id,
+                user_answer=user_answer,
+                submitted_at=timezone.now(),
+            )
+            
+            return Response({
+                "answer_id": str(answer.id),
+                "question_id": str(question_id),
+                "user_answer": user_answer,
+                "submitted_at": answer.submitted_at,
+            }, status=201)
+            
+        except InterviewQuestion.DoesNotExist:
+            return Response({"detail": "Question not found"}, status=404)
+        except Exception as e:
+            return Response({"detail": f"Failed to store answer: {str(e)}"}, status=400)
+
+
+class InterviewHistoryView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        """Get user's interview history and progress.
+
+        Query params:
+          - limit (optional): number of sessions to return (default: 10)
+          - session_id (optional): get specific session details
+        """
+        try:
+            sb_user = SbUser.objects.get(email=request.user.email)
+        except SbUser.DoesNotExist:
+            return Response({"detail": "User not found"}, status=404)
+
+        limit = int(request.query_params.get("limit", 10))
+        session_id = request.query_params.get("session_id")
+
+        if session_id:
+            # Get specific session with all details
+            try:
+                session = InterviewSession.objects.get(id=session_id, user_id=sb_user.id)
+                questions = InterviewQuestion.objects.filter(session_id=session.id)
+                
+                session_data = {
+                    "session": InterviewSessionSerializer(session).data,
+                    "questions": []
+                }
+                
+                for question in questions:
+                    question_data = InterviewQuestionSerializer(question).data
+                    
+                    # Get answers and evaluations for this question
+                    answers = InterviewAnswer.objects.filter(question_id=question.id)
+                    question_data["answers"] = []
+                    
+                    for answer in answers:
+                        answer_data = InterviewAnswerSerializer(answer).data
+                        
+                        # Get evaluation for this answer
+                        try:
+                            evaluation = InterviewEvaluation.objects.get(answer_id=answer.id)
+                            answer_data["evaluation"] = InterviewEvaluationSerializer(evaluation).data
+                        except InterviewEvaluation.DoesNotExist:
+                            answer_data["evaluation"] = None
+                        
+                        question_data["answers"].append(answer_data)
+                    
+                    session_data["questions"].append(question_data)
+                
+                return Response(session_data, status=200)
+                
+            except InterviewSession.DoesNotExist:
+                return Response({"detail": "Session not found"}, status=404)
+        else:
+            # Get recent sessions summary
+            sessions = InterviewSession.objects.filter(user_id=sb_user.id).order_by('-created_at')[:limit]
+            
+            sessions_data = []
+            for session in sessions:
+                session_info = InterviewSessionSerializer(session).data
+                
+                # Get question count
+                question_count = InterviewQuestion.objects.filter(session_id=session.id).count()
+                session_info["question_count"] = question_count
+                
+                # Get completion stats
+                answered_questions = InterviewAnswer.objects.filter(
+                    question__session_id=session.id
+                ).values_list('question_id', flat=True).distinct().count()
+                session_info["answered_questions"] = answered_questions
+                session_info["completion_rate"] = (answered_questions / question_count * 100) if question_count > 0 else 0
+                
+                # Get average score
+                evaluations = InterviewEvaluation.objects.filter(
+                    answer__question__session_id=session.id
+                )
+                if evaluations.exists():
+                    avg_score = sum(e.overall_score for e in evaluations) / evaluations.count()
+                    session_info["average_score"] = round(avg_score, 1)
+                else:
+                    session_info["average_score"] = None
+                
+                sessions_data.append(session_info)
+            
+            return Response({
+                "sessions": sessions_data,
+                "total_sessions": InterviewSession.objects.filter(user_id=sb_user.id).count(),
+            }, status=200)
+
+
+class InterviewProgressView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        """Get user's overall interview progress and statistics."""
+        try:
+            sb_user = SbUser.objects.get(email=request.user.email)
+        except SbUser.DoesNotExist:
+            return Response({"detail": "User not found"}, status=404)
+
+        # Get overall statistics
+        total_sessions = InterviewSession.objects.filter(user_id=sb_user.id).count()
+        total_questions = InterviewQuestion.objects.filter(session__user_id=sb_user.id).count()
+        total_answers = InterviewAnswer.objects.filter(question__session__user_id=sb_user.id).count()
+        
+        # Get average scores by category
+        evaluations = InterviewEvaluation.objects.filter(
+            answer__question__session__user_id=sb_user.id
+        ).select_related('answer__question')
+        
+        category_scores = {}
+        difficulty_scores = {}
+        
+        for evaluation in evaluations:
+            category = evaluation.answer.question.category
+            difficulty = evaluation.answer.question.difficulty
+            
+            if category not in category_scores:
+                category_scores[category] = []
+            if difficulty not in difficulty_scores:
+                difficulty_scores[difficulty] = []
+                
+            category_scores[category].append(evaluation.overall_score)
+            difficulty_scores[difficulty].append(evaluation.overall_score)
+        
+        # Calculate averages
+        category_averages = {
+            category: round(sum(scores) / len(scores), 1) 
+            for category, scores in category_scores.items()
+        }
+        difficulty_averages = {
+            difficulty: round(sum(scores) / len(scores), 1) 
+            for difficulty, scores in difficulty_scores.items()
+        }
+        
+        # Get recent performance trend (last 5 sessions)
+        recent_sessions = InterviewSession.objects.filter(
+            user_id=sb_user.id
+        ).order_by('-created_at')[:5]
+        
+        performance_trend = []
+        for session in recent_sessions:
+            session_evaluations = InterviewEvaluation.objects.filter(
+                answer__question__session_id=session.id
+            )
+            if session_evaluations.exists():
+                avg_score = sum(e.overall_score for e in session_evaluations) / session_evaluations.count()
+                performance_trend.append({
+                    "session_id": str(session.id),
+                    "date": session.created_at,
+                    "average_score": round(avg_score, 1),
+                    "question_count": session_evaluations.count()
+                })
+        
+        return Response({
+            "overall_stats": {
+                "total_sessions": total_sessions,
+                "total_questions": total_questions,
+                "total_answers": total_answers,
+                "completion_rate": (total_answers / total_questions * 100) if total_questions > 0 else 0,
+            },
+            "category_performance": category_averages,
+            "difficulty_performance": difficulty_averages,
+            "performance_trend": performance_trend,
+        }, status=200)

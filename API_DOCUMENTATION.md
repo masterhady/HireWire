@@ -402,6 +402,182 @@ curl -X DELETE http://localhost:8080/api/jobs/{job_id}/skills/{skill_id}/ \
 
 ---
 
+## Interview Storage APIs
+
+### Interview Answer Submission API
+
+#### Submit Answer
+**POST** `/interview/submit-answer/`
+
+**Description:** Submit a user's answer to an interview question for storage.
+
+**Authentication:** Required (JWT token)
+
+**Request Body:**
+```json
+{
+  "question_id": "uuid-of-interview-question",
+  "user_answer": "I led a team of 5 developers to build a microservices architecture..."
+}
+```
+
+**Response:**
+```json
+{
+  "answer_id": "uuid",
+  "question_id": "uuid",
+  "user_answer": "string",
+  "submitted_at": "2024-01-15T10:30:00Z"
+}
+```
+
+**cURL Example:**
+```bash
+curl -X POST http://localhost:8000/api/interview/submit-answer/ \
+  -H "Authorization: Bearer YOUR_JWT_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "question_id": "123e4567-e89b-12d3-a456-426614174000",
+    "user_answer": "I led a team of 5 developers to build a microservices architecture that improved system performance by 40%"
+  }'
+```
+
+### Interview History API
+
+#### Get Interview History
+**GET** `/interview/history/`
+
+**Description:** Get user's interview history and progress.
+
+**Authentication:** Required (JWT token)
+
+**Query Parameters:**
+- `limit` (optional): Number of sessions to return (default: 10)
+- `session_id` (optional): Get specific session details
+
+**Response (Summary):**
+```json
+{
+  "sessions": [
+    {
+      "id": "uuid",
+      "user": "uuid",
+      "job_description": "string",
+      "difficulty": "string",
+      "created_at": "2024-01-15T10:30:00Z",
+      "question_count": 5,
+      "answered_questions": 3,
+      "completion_rate": 60.0,
+      "average_score": 85.5
+    }
+  ],
+  "total_sessions": 10
+}
+```
+
+**Response (Session Details):**
+```json
+{
+  "session": {
+    "id": "uuid",
+    "user": "uuid",
+    "job_description": "string",
+    "difficulty": "string",
+    "created_at": "2024-01-15T10:30:00Z"
+  },
+  "questions": [
+    {
+      "id": "uuid",
+      "session": "uuid",
+      "question": "string",
+      "category": "string",
+      "difficulty": "string",
+      "tips": "string",
+      "expected_answer_focus": "string",
+      "created_at": "2024-01-15T10:30:00Z",
+      "answers": [
+        {
+          "id": "uuid",
+          "question": "uuid",
+          "user_answer": "string",
+          "submitted_at": "2024-01-15T10:30:00Z",
+          "evaluation": {
+            "id": "uuid",
+            "answer": "uuid",
+            "overall_score": 85,
+            "strengths": ["string"],
+            "weaknesses": ["string"],
+            "correct_answer": "string",
+            "answer_analysis": "string",
+            "improvement_tips": ["string"],
+            "follow_up_questions": ["string"],
+            "evaluated_at": "2024-01-15T10:30:00Z"
+          }
+        }
+      ]
+    }
+  ]
+}
+```
+
+**cURL Examples:**
+```bash
+# Get recent sessions summary
+curl -X GET "http://localhost:8000/api/interview/history/?limit=5" \
+  -H "Authorization: Bearer YOUR_JWT_TOKEN"
+
+# Get specific session details
+curl -X GET "http://localhost:8000/api/interview/history/?session_id=123e4567-e89b-12d3-a456-426614174000" \
+  -H "Authorization: Bearer YOUR_JWT_TOKEN"
+```
+
+### Interview Progress API
+
+#### Get Interview Progress
+**GET** `/interview/progress/`
+
+**Description:** Get user's overall interview progress and statistics.
+
+**Authentication:** Required (JWT token)
+
+**Response:**
+```json
+{
+  "overall_stats": {
+    "total_sessions": 10,
+    "total_questions": 50,
+    "total_answers": 35,
+    "completion_rate": 70.0
+  },
+  "category_performance": {
+    "Technical": 85.5,
+    "Behavioral": 78.2,
+    "Leadership": 82.1
+  },
+  "difficulty_performance": {
+    "easy": 90.0,
+    "medium": 82.5,
+    "hard": 75.0
+  },
+  "performance_trend": [
+    {
+      "session_id": "uuid",
+      "date": "2024-01-15T10:30:00Z",
+      "average_score": 85.5,
+      "question_count": 5
+    }
+  ]
+}
+```
+
+**cURL Example:**
+```bash
+curl -X GET http://localhost:8000/api/interview/progress/ \
+  -H "Authorization: Bearer YOUR_JWT_TOKEN"
+```
+
+---
+
 ### CVs
 
 #### List CVs
@@ -1032,5 +1208,93 @@ curl -X POST http://localhost:8080/api/interview/practice/ \
   "detailed_feedback": "Your answer demonstrates strong technical knowledge and problem-solving skills. The explanation of code splitting and bundle optimization shows deep understanding. To strengthen your response, consider adding more context about team dynamics and the broader business impact of your work.",
   "question": "Tell me about a challenging project you worked on",
   "answer": "I worked on a React application that had performance issues..."
+}
+```
+
+---
+
+### Interview Answer Evaluation (New)
+**POST** `/interview/evaluate/`
+
+**Description:** Evaluate user's answer to interview questions and provide the correct/ideal answer with detailed feedback and improvement tips.
+
+**Authentication:** Required
+
+**Request Body:**
+```json
+{
+  "question": "string (required)",
+  "user_answer": "string (required)",
+  "cv_id": "uuid (optional)",
+  "cv_text": "string (optional)",
+  "job_description": "string (optional)"
+}
+```
+
+**Response Fields:**
+- `overall_score`: Score from 0-100
+- `strengths`: Array of positive aspects in the answer
+- `weaknesses`: Array of areas that need improvement
+- `correct_answer`: The ideal/perfect answer to the question
+- `answer_analysis`: Detailed analysis of the user's answer
+- `improvement_tips`: Specific tips to improve future answers
+- `follow_up_questions`: Suggested follow-up questions for practice
+- `question`: The original question
+- `user_answer`: The submitted answer
+
+**Examples:**
+```bash
+# Evaluate answer with CV context
+curl -X POST http://localhost:8080/api/interview/evaluate/ \
+  -H "Authorization: Bearer <access_token>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "question": "Tell me about a challenging project you worked on",
+    "user_answer": "I worked on a React app that was slow. I optimized it by using code splitting and lazy loading.",
+    "job_description": "Senior Frontend Developer role..."
+  }'
+
+# Evaluate with specific CV
+curl -X POST http://localhost:8080/api/interview/evaluate/ \
+  -H "Authorization: Bearer <access_token>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "question": "How do you handle state management in React?",
+    "user_answer": "I use Redux for complex apps and Context API for simple state.",
+    "cv_id": "<cv_uuid>"
+  }'
+```
+
+**Example Response:**
+```json
+{
+  "overall_score": 72,
+  "strengths": [
+    "Good technical knowledge of React optimization",
+    "Mentioned specific techniques (code splitting, lazy loading)",
+    "Clear and concise communication"
+  ],
+  "weaknesses": [
+    "Missing specific metrics or results",
+    "No mention of challenges faced",
+    "Could include team collaboration aspects"
+  ],
+  "correct_answer": "The ideal answer would include: 1) Specific project context and your role, 2) The challenge you faced (e.g., 'bundle size was 2MB, load time 8 seconds'), 3) Your solution with technical details, 4) Quantifiable results ('reduced bundle to 800KB, load time to 2 seconds'), 5) What you learned and how it helped the team/business.",
+  "answer_analysis": "Your answer shows good technical understanding and mentions relevant optimization techniques. However, it lacks specific details about the project scope, your role, the impact of your work, and the challenges you overcame. A stronger answer would include metrics and business impact.",
+  "improvement_tips": [
+    "Use the STAR method (Situation, Task, Action, Result)",
+    "Include specific numbers and metrics",
+    "Mention your role and responsibilities",
+    "Describe challenges and how you overcame them",
+    "Connect your work to business outcomes"
+  ],
+  "follow_up_questions": [
+    "What was the most challenging part of that optimization project?",
+    "How did you measure the performance improvements?",
+    "What would you do differently if you had to do it again?",
+    "How did this project impact your team or the business?"
+  ],
+  "question": "Tell me about a challenging project you worked on",
+  "user_answer": "I worked on a React app that was slow. I optimized it by using code splitting and lazy loading."
 }
 ```

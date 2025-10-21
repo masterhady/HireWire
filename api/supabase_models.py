@@ -121,4 +121,59 @@ class Recommendation(models.Model):
 
 
 # job_skills has a composite primary key (job_id, skill_id). Django does not support composite PKs in ORM.
-# We will interact with it via raw SQL in views. 
+# We will interact with it via raw SQL in views.
+
+
+class InterviewSession(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    user = models.ForeignKey(SbUser, models.DO_NOTHING, db_column="user_id")
+    job_description = models.TextField()
+    difficulty = models.CharField(max_length=20, default="medium")
+    created_at = models.DateTimeField()
+
+    class Meta:
+        managed = False
+        db_table = "interview_sessions"
+
+
+class InterviewQuestion(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    session = models.ForeignKey(InterviewSession, models.DO_NOTHING, db_column="session_id")
+    question = models.TextField()
+    category = models.CharField(max_length=50)
+    difficulty = models.CharField(max_length=20)
+    tips = models.TextField(blank=True, null=True)
+    expected_answer_focus = models.TextField(blank=True, null=True)
+    created_at = models.DateTimeField()
+
+    class Meta:
+        managed = False
+        db_table = "interview_questions"
+
+
+class InterviewAnswer(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    question = models.ForeignKey(InterviewQuestion, models.DO_NOTHING, db_column="question_id")
+    user_answer = models.TextField()
+    submitted_at = models.DateTimeField()
+
+    class Meta:
+        managed = False
+        db_table = "interview_answers"
+
+
+class InterviewEvaluation(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    answer = models.ForeignKey(InterviewAnswer, models.DO_NOTHING, db_column="answer_id")
+    overall_score = models.IntegerField()
+    strengths = models.JSONField(blank=True, null=True)
+    weaknesses = models.JSONField(blank=True, null=True)
+    correct_answer = models.TextField(blank=True, null=True)
+    answer_analysis = models.TextField(blank=True, null=True)
+    improvement_tips = models.JSONField(blank=True, null=True)
+    follow_up_questions = models.JSONField(blank=True, null=True)
+    evaluated_at = models.DateTimeField()
+
+    class Meta:
+        managed = False
+        db_table = "interview_evaluations" 

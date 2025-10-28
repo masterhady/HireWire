@@ -1199,6 +1199,8 @@ class InterviewQuestionsView(APIView):
                 "job_description": job_description,
                 "difficulty": difficulty,
                 "question_count": len(stored_questions),
+                "instructions": "Answer all questions, then use /api/interview/submit-all-answers/ to submit all answers for batch evaluation.",
+                "flow": "batch_processing"
             }
             return Response(result, status=200)
             
@@ -1556,6 +1558,217 @@ class InterviewAnswerSubmissionView(APIView):
             return Response({"detail": "Question not found"}, status=404)
         except Exception as e:
             return Response({"detail": f"Failed to store answer: {str(e)}"}, status=400)
+
+
+class InterviewBatchSubmissionView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request):
+        """Submit all answers for a session and get batch AI evaluation.
+
+        Body:
+          - session_id (required): interview session ID
+          - answers (required): array of {question_id, user_answer}
+        """
+        session_id = request.data.get("session_id")
+        answers_data = request.data.get("answers", [])
+
+        if not session_id:
+            return Response({"detail": "session_id is required"}, status=400)
+        
+        if not answers_data or not isinstance(answers_data, list):
+            return Response({"detail": "answers array is required"}, status=400)
+
+        try:
+            # Verify user owns this session
+            sb_user = SbUser.objects.get(email=request.user.email)
+            session = InterviewSession.objects.get(id=session_id, user_id=sb_user.id)
+        except SbUser.DoesNotExist:
+            return Response({"detail": "User not found"}, status=404)
+        except InterviewSession.DoesNotExist:
+            return Response({"detail": "Session not found or access denied"}, status=404)
+
+        # Get all questions for this session
+        questions = InterviewQuestion.objects.filter(session_id=session_id)
+        question_dict = {str(q.id): q for q in questions}
+
+        # Validate and store all answers
+        stored_answers = []
+        for answer_data in answers_data:
+            question_id = answer_data.get("question_id")
+            user_answer = answer_data.get("user_answer", "").strip()
+            
+            if not question_id or not user_answer:
+                continue
+                
+            if question_id not in question_dict:
+                continue
+                
+            try:
+                # Check if answer already exists, update or create
+                answer, created = InterviewAnswer.objects.get_or_create(
+                    question_id=question_id,
+                    defaults={
+                        'user_answer': user_answer,
+                        'submitted_at': timezone.now(),
+                    }
+                )
+                if not created:
+                    answer.user_answer = user_answer
+                    answer.submitted_at = timezone.now()
+                    answer.save()
+                
+                stored_answers.append({
+                    'answer_id': str(answer.id),
+                    'question_id': question_id,
+                    'question': question_dict[question_id].question,
+                    'user_answer': user_answer,
+                    'answer_obj': answer
+                })
+            except Exception as e:
+                continue
+
+        if not stored_answers:
+            return Response({"detail": "No valid answers to process"}, status=400)
+
+        # Get CV context for evaluation
+        cv_text = ""
+        latest_cv = CV.objects.filter(user_id=sb_user.id).order_by('-created_at').first()
+        if latest_cv:
+            cv_text = latest_cv.parsed_text or ""
+
+        # Call Fireworks for batch evaluation
+        if not FIREWORKS_API_KEY:
+            return Response({
+                "detail": "FIREWORKS_API_KEY is not set",
+                "hint": "Configure FIREWORKS_API_KEY in environment",
+            }, status=400)
+
+        # Prepare batch evaluation prompt
+        system_prompt = (
+            "You are an expert interview coach providing comprehensive feedback on a complete interview session. "
+            "Analyze all questions and answers together to provide holistic evaluation. "
+            "Return STRICT JSON with evaluations array. Each evaluation should have: "
+            "overall_score (0-100), strengths (array), weaknesses (array), "
+            "correct_answer (string), answer_analysis (string), improvement_tips (array), "
+            "follow_up_questions (array). "
+            "Consider the flow and consistency across all answers."
+        )
+
+        # Build context for all Q&A pairs
+        qa_context = []
+        for i, answer_data in enumerate(stored_answers, 1):
+            qa_context.append(
+                f"Question {i}: {answer_data['question']}\n"
+                f"Candidate's Answer {i}: {answer_data['user_answer']}"
+            )
+
+        user_prompt = (
+            f"Candidate Background:\n{cv_text}\n\n"
+            f"Job Description:\n{session.job_description}\n\n"
+            f"Interview Session (Complete):\n" + "\n\n".join(qa_context) + "\n\n"
+            "Provide comprehensive evaluation for each answer in this JSON format:\n"
+            '{"evaluations": [{"overall_score": 85, "strengths": ["Clear examples", "Good structure"], '
+            '"weaknesses": ["Could be more specific", "Missing metrics"], '
+            '"correct_answer": "The ideal answer would include...", '
+            '"answer_analysis": "Your response demonstrates...", '
+            '"improvement_tips": ["Add specific metrics", "Include more details"], '
+            '"follow_up_questions": ["Can you elaborate on...", "What was the impact of..."]}]}'
+        )
+
+        try:
+            url = f"{FIREWORKS_BASE_URL}/chat/completions"
+            model_name = config("FIREWORKS_CHAT_MODEL", default="accounts/fireworks/models/llama-v3p1-70b-instruct")
+            headers = {
+                "Authorization": f"Bearer {FIREWORKS_API_KEY}",
+                "Content-Type": "application/json",
+            }
+            payload = {
+                "model": model_name,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                "temperature": 0.3,
+                "response_format": {"type": "json_object"},
+            }
+            r = requests.post(url, headers=headers, json=payload, timeout=120)  # Longer timeout for batch
+            if not r.ok:
+                return Response({"detail": f"Fireworks error: {r.status_code}", "body": r.text}, status=400)
+            
+            data_resp = r.json()
+            content = data_resp.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+            
+            def _parse_json(s: str):
+                try:
+                    return json.loads(s)
+                except Exception:
+                    m = re.search(r"\{[\s\S]*\}", s)
+                    if m:
+                        try:
+                            return json.loads(m.group(0))
+                        except Exception:
+                            return None
+                    return None
+
+            evaluation_data = _parse_json(content)
+            if not isinstance(evaluation_data, dict) or "evaluations" not in evaluation_data:
+                return Response({
+                    "detail": "Model returned invalid evaluation format",
+                    "raw": content,
+                }, status=400)
+
+            evaluations = evaluation_data.get("evaluations", [])
+            
+            # Store evaluations in database
+            stored_evaluations = []
+            for i, eval_data in enumerate(evaluations):
+                if i >= len(stored_answers):
+                    break
+                    
+                answer_obj = stored_answers[i]['answer_obj']
+                
+                # Delete existing evaluation if any
+                InterviewEvaluation.objects.filter(answer_id=answer_obj.id).delete()
+                
+                # Create new evaluation
+                evaluation = InterviewEvaluation.objects.create(
+                    answer_id=answer_obj.id,
+                    overall_score=eval_data.get("overall_score", 0),
+                    strengths=eval_data.get("strengths", []),
+                    weaknesses=eval_data.get("weaknesses", []),
+                    correct_answer=eval_data.get("correct_answer", ""),
+                    answer_analysis=eval_data.get("answer_analysis", ""),
+                    improvement_tips=eval_data.get("improvement_tips", []),
+                    follow_up_questions=eval_data.get("follow_up_questions", []),
+                    evaluated_at=timezone.now(),
+                )
+                
+                stored_evaluations.append({
+                    "evaluation_id": str(evaluation.id),
+                    "answer_id": str(answer_obj.id),
+                    "question_id": stored_answers[i]['question_id'],
+                    "question": stored_answers[i]['question'],
+                    "user_answer": stored_answers[i]['user_answer'],
+                    "evaluation": InterviewEvaluationSerializer(evaluation).data
+                })
+
+            # Calculate session statistics
+            scores = [eval_data.get("overall_score", 0) for eval_data in evaluations if eval_data.get("overall_score")]
+            average_score = sum(scores) / len(scores) if scores else 0
+            
+            return Response({
+                "session_id": str(session_id),
+                "total_questions": len(stored_answers),
+                "total_evaluations": len(stored_evaluations),
+                "average_score": round(average_score, 1),
+                "evaluations": stored_evaluations,
+                "session_complete": True,
+                "message": "All answers evaluated successfully using batch AI processing"
+            }, status=200)
+
+        except Exception as e:
+            return Response({"detail": f"Batch evaluation failed: {str(e)}"}, status=400)
 
 
 class InterviewHistoryView(APIView):

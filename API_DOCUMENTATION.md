@@ -1085,10 +1085,13 @@ curl -X POST http://localhost:8080/api/career-advisor/ \
 ```
 
 **Response Fields:**
-- `questions`: Array of question objects with question, category, difficulty, tips, expected_answer_focus
+- `session_id`: Interview session UUID for tracking
+- `questions`: Array of question objects with id, question, category, difficulty, tips, expected_answer_focus
 - `job_description`: The target job description
 - `difficulty`: Selected difficulty level
 - `question_count`: Number of questions generated
+- `instructions`: Instructions for the batch processing flow
+- `flow`: Set to "batch_processing" to indicate the new flow
 
 **Examples:**
 ```bash
@@ -1116,8 +1119,10 @@ curl -X POST http://localhost:8080/api/interview/questions/ \
 **Example Response:**
 ```json
 {
+  "session_id": "session-uuid-here",
   "questions": [
     {
+      "id": "question-1-uuid",
       "question": "Tell me about a challenging React project you worked on and how you solved performance issues",
       "category": "technical",
       "difficulty": "hard",
@@ -1125,6 +1130,7 @@ curl -X POST http://localhost:8080/api/interview/questions/ \
       "expected_answer_focus": "problem-solving, technical depth, and measurable results"
     },
     {
+      "id": "question-2-uuid",
       "question": "How do you handle state management in large React applications?",
       "category": "technical",
       "difficulty": "medium",
@@ -1134,7 +1140,9 @@ curl -X POST http://localhost:8080/api/interview/questions/ \
   ],
   "job_description": "Senior Frontend Developer...",
   "difficulty": "hard",
-  "question_count": 2
+  "question_count": 2,
+  "instructions": "Answer all questions, then use /api/interview/submit-all-answers/ to submit all answers for batch evaluation.",
+  "flow": "batch_processing"
 }
 ```
 
@@ -1298,3 +1306,95 @@ curl -X POST http://localhost:8080/api/interview/evaluate/ \
   "user_answer": "I worked on a React app that was slow. I optimized it by using code splitting and lazy loading."
 }
 ```
+
+---
+
+### Interview Batch Submission API (New)
+**POST** `/interview/submit-all-answers/`
+
+**Description:** Submit all answers for an interview session and receive comprehensive batch AI evaluation. This is the recommended approach for realistic interview simulation - generate all questions first, collect all answers, then evaluate everything together for holistic feedback.
+
+**Authentication:** Required
+
+**Request Body:**
+```json
+{
+  "session_id": "uuid (required)",
+  "answers": [
+    {
+      "question_id": "uuid (required)",
+      "user_answer": "string (required)"
+    }
+  ]
+}
+```
+
+**Response Fields:**
+- `session_id`: Interview session UUID
+- `total_questions`: Number of questions in the session
+- `total_evaluations`: Number of answers evaluated
+- `average_score`: Overall session score (0-100)
+- `evaluations`: Array of detailed evaluations for each answer
+- `session_complete`: Boolean indicating if session is complete
+- `message`: Success message
+
+**Examples:**
+```bash
+# Submit all answers for batch evaluation
+curl -X POST http://localhost:8080/api/interview/submit-all-answers/ \
+  -H "Authorization: Bearer <access_token>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "session_id": "session-uuid-here",
+    "answers": [
+      {
+        "question_id": "question-1-uuid",
+        "user_answer": "I led a team of 5 developers to build a microservices architecture that reduced system latency by 40% and improved scalability to handle 10x more users..."
+      },
+      {
+        "question_id": "question-2-uuid", 
+        "user_answer": "For state management in large React applications, I prefer Redux Toolkit with RTK Query for complex apps, but Context API for simpler state needs..."
+      },
+      {
+        "question_id": "question-3-uuid",
+        "user_answer": "My biggest challenge was migrating a legacy monolith to microservices while maintaining zero downtime. I used the strangler fig pattern..."
+      }
+    ]
+  }'
+```
+
+**Example Response:**
+```json
+{
+  "session_id": "session-uuid-here",
+  "total_questions": 3,
+  "total_evaluations": 3,
+  "average_score": 82.3,
+  "evaluations": [
+    {
+      "evaluation_id": "eval-1-uuid",
+      "answer_id": "answer-1-uuid",
+      "question_id": "question-1-uuid",
+      "question": "Tell me about a challenging project you led",
+      "user_answer": "I led a team of 5 developers...",
+      "evaluation": {
+        "overall_score": 85,
+        "strengths": ["Clear leadership example", "Quantifiable results", "Technical depth"],
+        "weaknesses": ["Could elaborate on team challenges", "Missing stakeholder management"],
+        "correct_answer": "The ideal answer would include specific project context, team dynamics, challenges faced, your leadership approach, technical decisions, and measurable business impact...",
+        "answer_analysis": "Strong technical leadership example with good metrics. Shows clear impact and technical understanding. Could be enhanced with more details about team management and stakeholder communication.",
+        "improvement_tips": ["Add details about team challenges and how you handled them", "Include stakeholder management aspects", "Mention lessons learned"],
+        "follow_up_questions": ["How did you handle conflicts within the team?", "What was the business impact of this project?"]
+      }
+    }
+  ],
+  "session_complete": true,
+  "message": "All answers evaluated successfully using batch AI processing"
+}
+```
+
+**Recommended Interview Flow:**
+1. **Generate Questions**: `POST /interview/questions/` - Get all questions for the session
+2. **Collect Answers**: User answers all questions (store locally or use individual submission)
+3. **Batch Evaluation**: `POST /interview/submit-all-answers/` - Submit all answers for comprehensive evaluation
+4. **Review Results**: Use the detailed evaluations for learning and improvement

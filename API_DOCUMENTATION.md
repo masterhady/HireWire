@@ -1398,3 +1398,271 @@ curl -X POST http://localhost:8080/api/interview/submit-all-answers/ \
 2. **Collect Answers**: User answers all questions (store locally or use individual submission)
 3. **Batch Evaluation**: `POST /interview/submit-all-answers/` - Submit all answers for comprehensive evaluation
 4. **Review Results**: Use the detailed evaluations for learning and improvement
+
+---
+
+## 🎤 Audio Interview APIs
+
+### Audio Interview Questions Generator
+**POST** `/audio-interview/questions/`
+
+**Description:** Generate AI-powered interview questions with automatic Text-to-Speech (TTS) conversion for realistic audio interviews.
+
+**Authentication:** Required
+
+**Request Body:**
+```json
+{
+  "job_description": "string (required)",
+  "cv_id": "uuid (optional)",
+  "cv_text": "string (optional)",
+  "question_count": 5,
+  "difficulty": "medium",
+  "voice_id": "alloy",
+  "language": "en"
+}
+```
+
+**Voice Options:**
+- `alloy` - Balanced, natural voice (default)
+- `echo` - Clear, professional tone
+- `fable` - Warm, engaging voice
+- `onyx` - Deep, authoritative voice
+- `nova` - Bright, energetic voice
+- `shimmer` - Soft, pleasant voice
+
+**Response Fields:**
+- `session_id`: Audio interview session UUID
+- `questions`: Array with audio-enabled question objects
+- `voice_id`: Selected TTS voice
+- `language`: Interview language
+- `instructions`: Audio interview flow instructions
+- `flow`: Set to "audio_batch_processing"
+
+**Example:**
+```bash
+curl -X POST http://localhost:8000/api/audio-interview/questions/ \
+  -H "Authorization: Bearer <access_token>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "job_description": "Senior Full Stack Developer with React and Node.js experience",
+    "question_count": 5,
+    "difficulty": "medium",
+    "voice_id": "alloy"
+  }'
+```
+
+**Example Response:**
+```json
+{
+  "session_id": "audio-session-uuid",
+  "questions": [
+    {
+      "id": "question-uuid",
+      "question": "Tell me about a challenging full-stack project you led",
+      "category": "behavioral",
+      "difficulty": "medium",
+      "tips": "Use STAR method",
+      "expected_answer_focus": "leadership and technical skills",
+      "audio_file_path": "audio/questions/question_uuid.mp3",
+      "audio_duration": 4.2,
+      "has_audio": true
+    }
+  ],
+  "voice_id": "alloy",
+  "language": "en",
+  "instructions": "Listen to each question, record your audio answer, then use /api/audio-interview/submit-all-answers/ for batch evaluation.",
+  "flow": "audio_batch_processing"
+}
+```
+
+---
+
+### Audio Interview Question Playback
+**GET** `/audio-interview/question/{question_id}/audio/`
+
+**Description:** Serve the TTS-generated audio file for a specific question.
+
+**Authentication:** Required
+
+**Response:** MP3 audio file stream
+
+**Example:**
+```bash
+curl -X GET http://localhost:8000/api/audio-interview/question/{question_id}/audio/ \
+  -H "Authorization: Bearer <access_token>" \
+  --output question_audio.mp3
+```
+
+**Frontend Usage:**
+```html
+<audio controls>
+  <source src="/api/audio-interview/question/{question_id}/audio/" type="audio/mpeg">
+</audio>
+```
+
+---
+
+### Audio Answer Submission
+**POST** `/audio-interview/submit-answer/`
+
+**Description:** Submit recorded audio answer with automatic Speech-to-Text (STT) transcription using OpenAI Whisper.
+
+**Authentication:** Required
+
+**Request:** `multipart/form-data`
+- `question_id`: UUID (required)
+- `audio_file`: Audio file (required) - supports .mp3, .wav, .webm, .m4a
+
+**Response Fields:**
+- `answer_id`: Submitted answer UUID
+- `transcribed_text`: Whisper API transcription result
+- `audio_duration`: Audio length in seconds
+- `transcription_confidence`: STT confidence score (0.0-1.0)
+
+**Example:**
+```bash
+curl -X POST http://localhost:8000/api/audio-interview/submit-answer/ \
+  -H "Authorization: Bearer <access_token>" \
+  -F "question_id=question-uuid-here" \
+  -F "audio_file=@my_answer.wav"
+```
+
+**Example Response:**
+```json
+{
+  "answer_id": "answer-uuid",
+  "question_id": "question-uuid",
+  "audio_file_path": "audio/answers/answer_uuid.wav",
+  "transcribed_text": "I led a team of 5 developers to build a microservices architecture...",
+  "audio_duration": 45.3,
+  "transcription_confidence": 0.92,
+  "submitted_at": "2024-01-15T10:35:00Z"
+}
+```
+
+---
+
+### Audio Interview Batch Evaluation
+**POST** `/audio-interview/submit-all-answers/`
+
+**Description:** Evaluate all audio answers in a session using batch AI processing. The AI considers transcription quality and provides holistic feedback.
+
+**Authentication:** Required
+
+**Request Body:**
+```json
+{
+  "session_id": "uuid (required)"
+}
+```
+
+**Response Fields:**
+- `evaluations`: Array of detailed evaluations for each transcribed answer
+- `interview_type`: Set to "audio"
+- `voice_id`: TTS voice used for questions
+- `transcription_confidence`: Average STT confidence across answers
+
+**Example:**
+```bash
+curl -X POST http://localhost:8000/api/audio-interview/submit-all-answers/ \
+  -H "Authorization: Bearer <access_token>" \
+  -H "Content-Type: application/json" \
+  -d '{"session_id": "audio-session-uuid"}'
+```
+
+**Example Response:**
+```json
+{
+  "session_id": "audio-session-uuid",
+  "total_questions": 5,
+  "total_evaluations": 5,
+  "average_score": 84.2,
+  "evaluations": [
+    {
+      "evaluation_id": "eval-uuid",
+      "question": "Tell me about a challenging project...",
+      "transcribed_text": "I led a team of 5 developers...",
+      "audio_duration": 45.3,
+      "transcription_confidence": 0.92,
+      "evaluation": {
+        "overall_score": 87,
+        "strengths": ["Clear communication", "Specific examples"],
+        "weaknesses": ["Could include more metrics", "Minor transcription unclear"],
+        "improvement_tips": ["Add quantifiable results", "Speak more clearly for better transcription"]
+      }
+    }
+  ],
+  "session_complete": true,
+  "interview_type": "audio",
+  "voice_id": "alloy",
+  "language": "en"
+}
+```
+
+---
+
+### Audio Interview History
+**GET** `/audio-interview/history/`
+
+**Description:** Get user's audio interview history and progress with audio-specific metadata.
+
+**Authentication:** Required
+
+**Query Parameters:**
+- `limit` (optional): Number of sessions (default: 10)
+- `session_id` (optional): Get specific session details
+
+**Example:**
+```bash
+# Get audio interview summary
+curl -X GET http://localhost:8000/api/audio-interview/history/ \
+  -H "Authorization: Bearer <access_token>"
+
+# Get specific audio session details
+curl -X GET "http://localhost:8000/api/audio-interview/history/?session_id=audio-session-uuid" \
+  -H "Authorization: Bearer <access_token>"
+```
+
+**Example Response:**
+```json
+{
+  "sessions": [
+    {
+      "id": "audio-session-uuid",
+      "job_description": "Senior Developer position...",
+      "difficulty": "medium",
+      "voice_id": "alloy",
+      "language": "en",
+      "created_at": "2024-01-15T10:00:00Z",
+      "question_count": 5,
+      "answered_questions": 5,
+      "completion_rate": 100,
+      "average_score": 84.2,
+      "interview_type": "audio"
+    }
+  ],
+  "total_sessions": 15,
+  "interview_type": "audio"
+}
+```
+
+---
+
+## 🎯 Audio Interview Flow
+
+**Complete Audio Interview Process:**
+
+1. **Generate Audio Questions**: `POST /audio-interview/questions/` - AI generates questions + TTS audio
+2. **Play Questions**: `GET /audio-interview/question/{id}/audio/` - Stream TTS audio to user
+3. **Record Answers**: User records audio responses using browser/app
+4. **Submit Audio**: `POST /audio-interview/submit-answer/` - Upload audio + automatic STT transcription
+5. **Batch Evaluation**: `POST /audio-interview/submit-all-answers/` - AI evaluates all transcribed answers
+6. **Review Results**: Comprehensive feedback with audio-specific insights
+
+**Key Features:**
+- 🎤 **Natural TTS Voices**: 6 professional voice options
+- 🗣️ **Automatic Transcription**: OpenAI Whisper with 90%+ accuracy
+- 🧠 **AI-Aware Evaluation**: Considers transcription quality in feedback
+- 📊 **Audio Metadata**: Duration, confidence scores, file paths
+- 🔄 **Batch Processing**: Holistic evaluation of complete sessions

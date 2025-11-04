@@ -1085,10 +1085,13 @@ curl -X POST http://localhost:8080/api/career-advisor/ \
 ```
 
 **Response Fields:**
-- `questions`: Array of question objects with question, category, difficulty, tips, expected_answer_focus
+- `session_id` (optional): Interview session UUID for tracking
+- `questions`: Array of question objects with id (optional), question, category, difficulty, tips, expected_answer_focus
 - `job_description`: The target job description
 - `difficulty`: Selected difficulty level
 - `question_count`: Number of questions generated
+- `instructions` (optional): Instructions for the batch processing flow
+-- `flow` (optional): Set to "batch_processing" to indicate the new flow
 
 **Examples:**
 ```bash
@@ -1116,8 +1119,10 @@ curl -X POST http://localhost:8080/api/interview/questions/ \
 **Example Response:**
 ```json
 {
+  "session_id": "session-uuid-here",
   "questions": [
     {
+      "id": "question-1-uuid",
       "question": "Tell me about a challenging React project you worked on and how you solved performance issues",
       "category": "technical",
       "difficulty": "hard",
@@ -1125,6 +1130,7 @@ curl -X POST http://localhost:8080/api/interview/questions/ \
       "expected_answer_focus": "problem-solving, technical depth, and measurable results"
     },
     {
+      "id": "question-2-uuid",
       "question": "How do you handle state management in large React applications?",
       "category": "technical",
       "difficulty": "medium",
@@ -1134,7 +1140,9 @@ curl -X POST http://localhost:8080/api/interview/questions/ \
   ],
   "job_description": "Senior Frontend Developer...",
   "difficulty": "hard",
-  "question_count": 2
+  "question_count": 2,
+  "instructions": "Answer all questions, then use /api/interview/submit-all-answers/ to submit all answers for batch evaluation.",
+  "flow": "batch_processing"
 }
 ```
 
@@ -1298,3 +1306,363 @@ curl -X POST http://localhost:8080/api/interview/evaluate/ \
   "user_answer": "I worked on a React app that was slow. I optimized it by using code splitting and lazy loading."
 }
 ```
+---
+
+### Interview Batch Submission API (New)
+**POST** `/interview/submit-all-answers/`
+
+**Description:** Submit all answers for an interview session and receive comprehensive batch AI evaluation. This is the recommended approach for realistic interview simulation - generate all questions first, collect all answers, then evaluate everything together for holistic feedback.
+
+**Authentication:** Required
+
+**Request Body:**
+```json
+{
+  "session_id": "uuid (required)",
+  "answers": [
+    {
+      "question_id": "uuid (required)",
+      "user_answer": "string (required)"
+    }
+  ]
+}
+```
+
+**Response Fields:**
+- `session_id`: Interview session UUID
+- `total_questions`: Number of questions in the session
+- `total_evaluations`: Number of answers evaluated
+- `average_score`: Overall session score (0-100)
+- `evaluations`: Array of detailed evaluations for each answer
+- `session_complete`: Boolean indicating if session is complete
+- `message`: Success message
+
+**Examples:**
+```bash
+# Submit all answers for batch evaluation
+curl -X POST http://localhost:8080/api/interview/submit-all-answers/ \
+  -H "Authorization: Bearer <access_token>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "session_id": "session-uuid-here",
+    "answers": [
+      {
+        "question_id": "question-1-uuid",
+        "user_answer": "I led a team of 5 developers to build a microservices architecture that reduced system latency by 40% and improved scalability to handle 10x more users..."
+      },
+      {
+        "question_id": "question-2-uuid", 
+        "user_answer": "For state management in large React applications, I prefer Redux Toolkit with RTK Query for complex apps, but Context API for simpler state needs..."
+      },
+      {
+        "question_id": "question-3-uuid",
+        "user_answer": "My biggest challenge was migrating a legacy monolith to microservices while maintaining zero downtime. I used the strangler fig pattern..."
+      }
+    ]
+  }'
+```
+
+**Example Response:**
+```json
+{
+  "session_id": "session-uuid-here",
+  "total_questions": 3,
+  "total_evaluations": 3,
+  "average_score": 82.3,
+  "evaluations": [
+    {
+      "evaluation_id": "eval-1-uuid",
+      "answer_id": "answer-1-uuid",
+      "question_id": "question-1-uuid",
+      "question": "Tell me about a challenging project you led",
+      "user_answer": "I led a team of 5 developers...",
+      "evaluation": {
+        "overall_score": 85,
+        "strengths": ["Clear leadership example", "Quantifiable results", "Technical depth"],
+        "weaknesses": ["Could elaborate on team challenges", "Missing stakeholder management"],
+        "correct_answer": "The ideal answer would include specific project context, team dynamics, challenges faced, your leadership approach, technical decisions, and measurable business impact...",
+        "answer_analysis": "Strong technical leadership example with good metrics. Shows clear impact and technical understanding. Could be enhanced with more details about team management and stakeholder communication.",
+        "improvement_tips": ["Add details about team challenges and how you handled them", "Include stakeholder management aspects", "Mention lessons learned"],
+        "follow_up_questions": ["How did you handle conflicts within the team?", "What was the business impact of this project?"]
+      }
+    }
+  ],
+  "session_complete": true,
+  "message": "All answers evaluated successfully using batch AI processing"
+}
+```
+
+**Recommended Interview Flow:**
+1. **Generate Questions**: `POST /interview/questions/` - Get all questions for the session
+2. **Collect Answers**: User answers all questions (store locally or use individual submission)
+3. **Batch Evaluation**: `POST /interview/submit-all-answers/` - Submit all answers for comprehensive evaluation
+4. **Review Results**: Use the detailed evaluations for learning and improvement
+
+---
+
+## 🎤 Audio Interview APIs
+
+### Audio Interview Questions Generator
+**POST** `/audio-interview/questions/`
+
+**Description:** Generate AI-powered interview questions with automatic Text-to-Speech (TTS) conversion for realistic audio interviews.
+
+**Authentication:** Required
+
+**Request Body:**
+```json
+{
+  "job_description": "string (required)",
+  "cv_id": "uuid (optional)",
+  "cv_text": "string (optional)",
+  "question_count": 5,
+  "difficulty": "medium",
+  "voice_id": "alloy",
+  "language": "en"
+}
+```
+
+**Voice Options:**
+- `alloy` - Balanced, natural voice (default)
+- `echo` - Clear, professional tone
+- `fable` - Warm, engaging voice
+- `onyx` - Deep, authoritative voice
+- `nova` - Bright, energetic voice
+- `shimmer` - Soft, pleasant voice
+
+**Response Fields:**
+- `session_id`: Audio interview session UUID
+- `questions`: Array with audio-enabled question objects
+- `voice_id`: Selected TTS voice
+- `language`: Interview language
+- `instructions`: Audio interview flow instructions
+- `flow`: Set to "audio_batch_processing"
+
+**Example:**
+```bash
+curl -X POST http://localhost:8000/api/audio-interview/questions/ \
+  -H "Authorization: Bearer <access_token>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "job_description": "Senior Full Stack Developer with React and Node.js experience",
+    "question_count": 5,
+    "difficulty": "medium",
+    "voice_id": "alloy"
+  }'
+```
+
+**Example Response:**
+```json
+{
+  "session_id": "audio-session-uuid",
+  "questions": [
+    {
+      "id": "question-uuid",
+      "question": "Tell me about a challenging full-stack project you led",
+      "category": "behavioral",
+      "difficulty": "medium",
+      "tips": "Use STAR method",
+      "expected_answer_focus": "leadership and technical skills",
+      "audio_file_path": "audio/questions/question_uuid.mp3",
+      "audio_duration": 4.2,
+      "has_audio": true
+    }
+  ],
+  "voice_id": "alloy",
+  "language": "en",
+  "instructions": "Listen to each question, record your audio answer, then use /api/audio-interview/submit-all-answers/ for batch evaluation.",
+  "flow": "audio_batch_processing"
+}
+```
+
+---
+
+### Audio Interview Question Playback
+**GET** `/audio-interview/question/{question_id}/audio/`
+
+**Description:** Serve the TTS-generated audio file for a specific question.
+
+**Authentication:** Required
+
+**Response:** MP3 audio file stream
+
+**Example:**
+```bash
+curl -X GET http://localhost:8000/api/audio-interview/question/{question_id}/audio/ \
+  -H "Authorization: Bearer <access_token>" \
+  --output question_audio.mp3
+```
+
+**Frontend Usage:**
+```html
+<audio controls>
+  <source src="/api/audio-interview/question/{question_id}/audio/" type="audio/mpeg">
+</audio>
+```
+
+---
+
+### Audio Answer Submission
+**POST** `/audio-interview/submit-answer/`
+
+**Description:** Submit recorded audio answer with automatic Speech-to-Text (STT) transcription using OpenAI Whisper.
+
+**Authentication:** Required
+
+**Request:** `multipart/form-data`
+- `question_id`: UUID (required)
+- `audio_file`: Audio file (required) - supports .mp3, .wav, .webm, .m4a
+
+**Response Fields:**
+- `answer_id`: Submitted answer UUID
+- `transcribed_text`: Whisper API transcription result
+- `audio_duration`: Audio length in seconds
+- `transcription_confidence`: STT confidence score (0.0-1.0)
+
+**Example:**
+```bash
+curl -X POST http://localhost:8000/api/audio-interview/submit-answer/ \
+  -H "Authorization: Bearer <access_token>" \
+  -F "question_id=question-uuid-here" \
+  -F "audio_file=@my_answer.wav"
+```
+
+**Example Response:**
+```json
+{
+  "answer_id": "answer-uuid",
+  "question_id": "question-uuid",
+  "audio_file_path": "audio/answers/answer_uuid.wav",
+  "transcribed_text": "I led a team of 5 developers to build a microservices architecture...",
+  "audio_duration": 45.3,
+  "transcription_confidence": 0.92,
+  "submitted_at": "2024-01-15T10:35:00Z"
+}
+```
+
+---
+
+### Audio Interview Batch Evaluation
+**POST** `/audio-interview/submit-all-answers/`
+
+**Description:** Evaluate all audio answers in a session using batch AI processing. The AI considers transcription quality and provides holistic feedback.
+
+**Authentication:** Required
+
+**Request Body:**
+```json
+{
+  "session_id": "uuid (required)"
+}
+```
+
+**Response Fields:**
+- `evaluations`: Array of detailed evaluations for each transcribed answer
+- `interview_type`: Set to "audio"
+- `voice_id`: TTS voice used for questions
+- `transcription_confidence`: Average STT confidence across answers
+
+**Example:**
+```bash
+curl -X POST http://localhost:8000/api/audio-interview/submit-all-answers/ \
+  -H "Authorization: Bearer <access_token>" \
+  -H "Content-Type: application/json" \
+  -d '{"session_id": "audio-session-uuid"}'
+```
+
+**Example Response:**
+```json
+{
+  "session_id": "audio-session-uuid",
+  "total_questions": 5,
+  "total_evaluations": 5,
+  "average_score": 84.2,
+  "evaluations": [
+    {
+      "evaluation_id": "eval-uuid",
+      "question": "Tell me about a challenging project...",
+      "transcribed_text": "I led a team of 5 developers...",
+      "audio_duration": 45.3,
+      "transcription_confidence": 0.92,
+      "evaluation": {
+        "overall_score": 87,
+        "strengths": ["Clear communication", "Specific examples"],
+        "weaknesses": ["Could include more metrics", "Minor transcription unclear"],
+        "improvement_tips": ["Add quantifiable results", "Speak more clearly for better transcription"]
+      }
+    }
+  ],
+  "session_complete": true,
+  "interview_type": "audio",
+  "voice_id": "alloy",
+  "language": "en"
+}
+```
+
+---
+
+### Audio Interview History
+**GET** `/audio-interview/history/`
+
+**Description:** Get user's audio interview history and progress with audio-specific metadata.
+
+**Authentication:** Required
+
+**Query Parameters:**
+- `limit` (optional): Number of sessions (default: 10)
+- `session_id` (optional): Get specific session details
+
+**Example:**
+```bash
+# Get audio interview summary
+curl -X GET http://localhost:8000/api/audio-interview/history/ \
+  -H "Authorization: Bearer <access_token>"
+
+# Get specific audio session details
+curl -X GET "http://localhost:8000/api/audio-interview/history/?session_id=audio-session-uuid" \
+  -H "Authorization: Bearer <access_token>"
+```
+
+**Example Response:**
+```json
+{
+  "sessions": [
+    {
+      "id": "audio-session-uuid",
+      "job_description": "Senior Developer position...",
+      "difficulty": "medium",
+      "voice_id": "alloy",
+      "language": "en",
+      "created_at": "2024-01-15T10:00:00Z",
+      "question_count": 5,
+      "answered_questions": 5,
+      "completion_rate": 100,
+      "average_score": 84.2,
+      "interview_type": "audio"
+    }
+  ],
+  "total_sessions": 15,
+  "interview_type": "audio"
+}
+```
+
+---
+
+## 🎯 Audio Interview Flow
+
+**Complete Audio Interview Process:**
+
+1. **Generate Audio Questions**: `POST /audio-interview/questions/` - AI generates questions + TTS audio
+2. **Play Questions**: `GET /audio-interview/question/{id}/audio/` - Stream TTS audio to user
+3. **Record Answers**: User records audio responses using browser/app
+4. **Submit Audio**: `POST /audio-interview/submit-answer/` - Upload audio + automatic STT transcription
+5. **Batch Evaluation**: `POST /audio-interview/submit-all-answers/` - AI evaluates all transcribed answers
+6. **Review Results**: Comprehensive feedback with audio-specific insights
+
+**Key Features:**
+- 🎤 **Natural TTS Voices**: 6 professional voice options
+- 🗣️ **Automatic Transcription**: OpenAI Whisper with 90%+ accuracy
+- 🧠 **AI-Aware Evaluation**: Considers transcription quality in feedback
+- 📊 **Audio Metadata**: Duration, confidence scores, file paths
+- 🔄 **Batch Processing**: Holistic evaluation of complete sessions
+

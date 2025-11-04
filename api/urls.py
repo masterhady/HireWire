@@ -24,8 +24,16 @@ from .supabase_views import (
     InterviewPracticeView,
     InterviewAnswerEvaluationView,
     InterviewAnswerSubmissionView,
+    InterviewBatchSubmissionView,
     InterviewHistoryView,
     InterviewProgressView,
+    AudioInterviewQuestionsView,
+    AudioInterviewQuestionAudioView,
+    AudioInterviewAnswerSubmissionView,
+    AudioInterviewBatchSubmissionView,
+    AudioInterviewEvaluationView,
+    AudioInterviewSessionEvaluationsView,
+    AudioInterviewHistoryView,
 )
 
 router = DefaultRouter()
@@ -54,7 +62,16 @@ urlpatterns = [
     path("interview/practice/", InterviewPracticeView.as_view(), name="interview_practice"),
     path("interview/evaluate/", InterviewAnswerEvaluationView.as_view(), name="interview_evaluate"),
     path("interview/submit-answer/", InterviewAnswerSubmissionView.as_view(), name="interview_submit_answer"),
+    path("interview/submit-all-answers/", InterviewBatchSubmissionView.as_view(), name="interview_batch_submission"),
     path("interview/history/", InterviewHistoryView.as_view(), name="interview_history"),
     path("interview/progress/", InterviewProgressView.as_view(), name="interview_progress"),
+    # Audio Interview APIs
+    path("audio-interview/questions/", AudioInterviewQuestionsView.as_view(), name="audio_interview_questions"),
+    path("audio-interview/question/<uuid:question_id>/audio/", AudioInterviewQuestionAudioView.as_view(), name="audio_interview_question_audio"),
+    path("audio-interview/submit-answer/", AudioInterviewAnswerSubmissionView.as_view(), name="audio_interview_submit_answer"),
+    path("audio-interview/submit-all-answers/", AudioInterviewBatchSubmissionView.as_view(), name="audio_interview_batch_submission"),
+    path("audio-interview/evaluation/<uuid:answer_id>/", AudioInterviewEvaluationView.as_view(), name="audio_interview_evaluation"),
+    path("audio-interview/session/<uuid:session_id>/evaluations/", AudioInterviewSessionEvaluationsView.as_view(), name="audio_interview_session_evaluations"),
+    path("audio-interview/history/", AudioInterviewHistoryView.as_view(), name="audio_interview_history"),
     path("", include(router.urls)),
 ]

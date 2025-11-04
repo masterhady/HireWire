@@ -13,6 +13,10 @@ from .supabase_models import (
     InterviewQuestion,
     InterviewAnswer,
     InterviewEvaluation,
+    AudioInterviewSession,
+    AudioInterviewQuestion,
+    AudioInterviewAnswer,
+    AudioInterviewEvaluation,
 )
 
 
@@ -90,7 +94,25 @@ class InterviewAnswerSerializer(serializers.ModelSerializer):
         fields = "__all__"
 
 
-class InterviewEvaluationSerializer(serializers.ModelSerializer):
+class AudioInterviewSessionSerializer(serializers.ModelSerializer):
     class Meta:
-        model = InterviewEvaluation
-        fields = "__all__" 
+        model = AudioInterviewSession
+        fields = "__all__"
+
+
+class AudioInterviewQuestionSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = AudioInterviewQuestion
+        fields = "__all__"
+
+
+class AudioInterviewAnswerSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = AudioInterviewAnswer
+        fields = "__all__"
+
+
+class AudioInterviewEvaluationSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = AudioInterviewEvaluation
+    fields = "__all__"

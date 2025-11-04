@@ -176,4 +176,65 @@ class InterviewEvaluation(models.Model):
 
     class Meta:
         managed = False
-        db_table = "interview_evaluations" 
+        db_table = "interview_evaluations"
+class AudioInterviewSession(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    user = models.ForeignKey(SbUser, models.DO_NOTHING, db_column="user_id")
+    job_description = models.TextField()
+    difficulty = models.CharField(max_length=20, default="medium")
+    voice_id = models.CharField(max_length=100, blank=True, null=True)  # For TTS voice selection
+    language = models.CharField(max_length=10, default="en")
+    created_at = models.DateTimeField()
+    
+    class Meta:
+        managed = False
+        db_table = "audio_interview_sessions"
+
+
+class AudioInterviewQuestion(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    session = models.ForeignKey(AudioInterviewSession, models.DO_NOTHING, db_column="session_id")
+    question = models.TextField()
+    category = models.CharField(max_length=50, blank=True, null=True)
+    difficulty = models.CharField(max_length=20, blank=True, null=True)
+    tips = models.TextField(blank=True, null=True)
+    expected_answer_focus = models.TextField(blank=True, null=True)
+    audio_file_path = models.CharField(max_length=500, blank=True, null=True)  # Path to TTS audio
+    audio_duration = models.FloatField(blank=True, null=True)  # Duration in seconds
+    created_at = models.DateTimeField()
+
+    class Meta:
+        managed = False
+        db_table = "audio_interview_questions"
+
+
+class AudioInterviewAnswer(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    question = models.ForeignKey(AudioInterviewQuestion, models.DO_NOTHING, db_column="question_id")
+    audio_file_path = models.CharField(max_length=500)  # Path to recorded audio
+    transcribed_text = models.TextField(blank=True, null=True)  # STT result
+    audio_duration = models.FloatField(blank=True, null=True)  # Duration in seconds
+    transcription_confidence = models.FloatField(blank=True, null=True)  # STT confidence score
+    submitted_at = models.DateTimeField()
+
+    class Meta:
+        managed = False
+        db_table = "audio_interview_answers"
+
+
+class AudioInterviewEvaluation(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    answer = models.ForeignKey(AudioInterviewAnswer, models.DO_NOTHING, db_column="answer_id")
+    overall_score = models.IntegerField()
+    strengths = models.JSONField(blank=True, null=True)
+    weaknesses = models.JSONField(blank=True, null=True)
+    correct_answer = models.TextField(blank=True, null=True)
+    answer_analysis = models.TextField(blank=True, null=True)
+    improvement_tips = models.JSONField(blank=True, null=True)
+    follow_up_questions = models.JSONField(blank=True, null=True)
+    audio_feedback_path = models.CharField(max_length=500, blank=True, null=True)  # TTS feedback
+    evaluated_at = models.DateTimeField()
+
+    class Meta:
+        managed = False
+        db_table = "audio_interview_evaluations"

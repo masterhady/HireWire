@@ -1,1 +1,22 @@
+__pycache__/
+*.py[cod]
+*.pyc
+*.pyo
+*.pyd
+*.db
+*.sqlite3
+
 venv/
+*.log
+.env
+
+# OS files
+*.swp
+*.DS_Store
+
+# Byte-compiled / cached
+__pycache__/
+
+# Virtual environments
+venv/
+env/

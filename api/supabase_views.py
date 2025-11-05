@@ -5,6 +5,9 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 from django.utils import timezone
 import uuid
+from django.core.files.base import ContentFile
+from django.core.files.storage import default_storage
+from django.http import HttpResponse
 
 from .supabase_models import (
     SbCompany,
@@ -20,6 +23,10 @@ from .supabase_models import (
     InterviewQuestion,
     InterviewAnswer,
     InterviewEvaluation,
+    AudioInterviewSession,
+    AudioInterviewQuestion,
+    AudioInterviewAnswer,
+    AudioInterviewEvaluation,
 )
 from .supabase_serializers import (
     CompanySerializer,
@@ -35,6 +42,10 @@ from .supabase_serializers import (
     InterviewQuestionSerializer,
     InterviewAnswerSerializer,
     InterviewEvaluationSerializer,
+    AudioInterviewSessionSerializer,
+    AudioInterviewQuestionSerializer,
+    AudioInterviewAnswerSerializer,
+    AudioInterviewEvaluationSerializer,
 )
 from .rag import (
     embed_text,
@@ -1937,9 +1948,6 @@ class InterviewProgressView(APIView):
 
         }, status=200)
 
-        }, status=200)
-
-
 # ==================== AUDIO INTERVIEW APIS ====================
 
 class AudioInterviewQuestionsView(APIView):
@@ -2186,19 +2194,24 @@ class AudioInterviewQuestionAudioView(APIView):
             )
             
             # Check if we have server-generated audio (ElevenLabs)
-            if question.audio_file_path and default_storage.exists(question.audio_file_path):
-                # Serve the audio file
-                file_content = default_storage.open(question.audio_file_path).read()
-                response = HttpResponse(file_content, content_type='audio/mpeg')
-                response['Content-Disposition'] = f'inline; filename="question_{question_id}.mp3"'
-                return response
-            else:
-                # Fallback to question text for client-side TTS
-                return Response({
-                    "question_text": question.question,
-                    "voice_id": question.session.voice_id or "alloy",
-                    "language": question.session.language
-                })
+            try:
+                if question.audio_file_path and default_storage.exists(question.audio_file_path):
+                    # Serve the audio file
+                    with default_storage.open(question.audio_file_path, "rb") as fh:
+                        file_content = fh.read()
+                    response = HttpResponse(file_content, content_type='audio/mpeg')
+                    response['Content-Disposition'] = f'inline; filename="question_{question_id}.mp3"'
+                    return response
+            except Exception:
+                # If storage access fails for any reason, fall back to JSON
+                pass
+
+            # Fallback to question text for client-side TTS
+            return Response({
+                "question_text": question.question,
+                "voice_id": question.session.voice_id or "alloy",
+                "language": question.session.language
+            })
                 
         except SbUser.DoesNotExist:
             return Response({"detail": "User not found"}, status=404)
@@ -2554,10 +2567,18 @@ class AudioInterviewEvaluationView(APIView):
             
             # Get evaluation
             try:
-                evaluation = AudioInterviewEvaluation.objects.get(answer=answer)
+                # In case multiple evaluations exist, return the most recent
+                evaluation = (
+                    AudioInterviewEvaluation.objects
+                    .filter(answer=answer)
+                    .order_by('-evaluated_at')
+                    .first()
+                )
+                if not evaluation:
+                    return Response({"detail": "No evaluation found for this answer"}, status=404)
                 return Response(AudioInterviewEvaluationSerializer(evaluation).data)
-            except AudioInterviewEvaluation.DoesNotExist:
-                return Response({"detail": "No evaluation found for this answer"}, status=404)
+            except Exception as e:
+                return Response({"detail": f"Failed to load evaluation: {str(e)}"}, status=400)
                 
         except SbUser.DoesNotExist:
             return Response({"detail": "User not found"}, status=404)
@@ -2579,21 +2600,32 @@ class AudioInterviewSessionEvaluationsView(APIView):
             session = AudioInterviewSession.objects.get(id=session_id, user_id=sb_user.id)
             
             # Get all evaluations for this session
-            evaluations = AudioInterviewEvaluation.objects.filter(
-                answer__question__session_id=session_id
-            ).order_by('evaluated_at')
+            evaluations = (
+                AudioInterviewEvaluation.objects
+                .select_related('answer', 'answer__question')
+                .filter(answer__question__session_id=session_id)
+                .order_by('evaluated_at')
+            )
             
             evaluations_data = []
             for evaluation in evaluations:
-                eval_data = AudioInterviewEvaluationSerializer(evaluation).data
-                eval_data['question_id'] = str(evaluation.answer.question_id)
-                eval_data['question'] = evaluation.answer.question.question
-                eval_data['transcribed_text'] = evaluation.answer.transcribed_text
-                eval_data['answer_id'] = str(evaluation.answer.id)
-                evaluations_data.append(eval_data)
+                try:
+                    eval_data = AudioInterviewEvaluationSerializer(evaluation).data
+                    if getattr(evaluation, 'answer', None) and getattr(evaluation.answer, 'question', None):
+                        eval_data['question_id'] = str(evaluation.answer.question_id)
+                        eval_data['question'] = evaluation.answer.question.question
+                    else:
+                        eval_data['question_id'] = None
+                        eval_data['question'] = None
+                    eval_data['transcribed_text'] = getattr(evaluation.answer, 'transcribed_text', None)
+                    eval_data['answer_id'] = str(getattr(evaluation.answer, 'id', ''))
+                    evaluations_data.append(eval_data)
+                except Exception:
+                    # Skip any problematic row
+                    continue
             
             # Calculate session statistics
-            scores = [e.overall_score for e in evaluations if e.overall_score]
+            scores = [e.overall_score for e in evaluations if getattr(e, 'overall_score', None) is not None]
             average_score = sum(scores) / len(scores) if scores else 0
             
             return Response({

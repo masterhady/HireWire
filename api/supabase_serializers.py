@@ -94,6 +94,12 @@ class InterviewAnswerSerializer(serializers.ModelSerializer):
         fields = "__all__"
 
 
+class InterviewEvaluationSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = InterviewEvaluation
+        fields = "__all__"
+
+
 class AudioInterviewSessionSerializer(serializers.ModelSerializer):
     class Meta:
         model = AudioInterviewSession
@@ -115,4 +121,4 @@ class AudioInterviewAnswerSerializer(serializers.ModelSerializer):
 class AudioInterviewEvaluationSerializer(serializers.ModelSerializer):
     class Meta:
         model = AudioInterviewEvaluation
-    fields = "__all__"
+        fields = "__all__"

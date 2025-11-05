@@ -1,22 +1,25 @@
+
+# Python
 __pycache__/
 *.py[cod]
-*.pyc
 *.pyo
 *.pyd
-*.db
-*.sqlite3
 
+# Virtual environment
 venv/
-*.log
-.env
+.env/
 
-# OS files
+# Media files (uploads, generated content)
+media/
+*.webm
+
+# Backup files
+*.bak
+*.fixed
+
+# OS / IDE
+.DS_Store
 *.swp
-*.DS_Store
+*.idea/
+.vscode/
 
-# Byte-compiled / cached
-__pycache__/
-
-# Virtual environments
-venv/
-env/

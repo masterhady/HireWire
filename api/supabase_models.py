@@ -75,8 +75,13 @@ class Job(models.Model):
     title = models.TextField()
     description = models.TextField(blank=True, null=True)
     requirements = models.TextField(blank=True, null=True)
+    responsibilities = models.TextField(blank=True, null=True)
+    employment_type = models.TextField(blank=True, null=True)
+    salary_range = models.TextField(blank=True, null=True)
     posted_at = models.DateTimeField()
+    updated_at = models.DateTimeField(blank=True, null=True)
     is_active = models.BooleanField()
+    posted_by = models.TextField(blank=True, null=True)
 
     class Meta:
         managed = False

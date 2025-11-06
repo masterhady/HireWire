@@ -57,6 +57,8 @@ from .rag import (
 )
 from decouple import config
 import re
+import base64
+import random
 import json
 import requests
 
@@ -184,6 +186,144 @@ class ApplicationViewSet(viewsets.ModelViewSet):
     serializer_class = ApplicationSerializer
     permission_classes = [permissions.IsAuthenticated]
 
+    def get_queryset(self):
+        qs = super().get_queryset()
+        request = self.request
+        mine = request.query_params.get("mine")
+        # If company user and mine=1, show applications for jobs posted by this user
+        try:
+            if mine in ("1", "true", "True") and request.user.is_authenticated:
+                # jobs.company points to AUTH_USER; filter applications where job.company == request.user
+                return qs.filter(job__company=request.user)
+        except Exception:
+            pass
+        return qs
+
+    @action(detail=False, methods=["get"], url_path=r"company/(?P<company_id>[^/]+)/dashboard-stats")
+    def company_dashboard_stats(self, request, company_id=None):
+        """Get dashboard stats for a company user."""
+        if not request.user.is_authenticated:
+            return Response({"detail": "Authentication required"}, status=401)
+        
+        try:
+            # Count active jobs posted by this user
+            active_jobs_count = Job.objects.filter(company=request.user, is_active=True).count()
+            
+            # Count total applications for jobs posted by this user
+            total_applicants_count = Application.objects.filter(job__company=request.user).count()
+            
+            # Profile views - placeholder (can be implemented later with tracking)
+            profile_views_count = 0
+            
+            return Response({
+                "active_jobs_count": active_jobs_count,
+                "total_applicants_count": total_applicants_count,
+                "profile_views_count": profile_views_count,
+            }, status=200)
+        except Exception as e:
+            return Response({"detail": str(e)}, status=500)
+
+    @action(detail=False, methods=["get"], url_path=r"company/(?P<company_id>[^/]+)/recent-applications")
+    def company_recent_applications(self, request, company_id=None):
+        """Get recent applications for a company user."""
+        if not request.user.is_authenticated:
+            return Response({"detail": "Authentication required"}, status=401)
+        
+        try:
+            apps = Application.objects.filter(job__company=request.user).order_by('-matched_at')[:10]
+            result = []
+            for app in apps:
+                try:
+                    job_title = app.job.title if app.job else None
+                    cv_filename = app.cv.filename if app.cv else None
+                    match_score = None
+                    if app.match_score is not None:
+                        match_score = float(app.match_score)
+                        if 0 < match_score <= 1:
+                            match_score = round(match_score * 100)
+                        else:
+                            match_score = round(match_score)
+                    
+                    result.append({
+                        "id": str(app.id),
+                        "candidate_name": cv_filename or "Unknown",
+                        "job_title": job_title or "Unknown",
+                        "match_score": match_score,
+                        "applied_at": app.matched_at.isoformat() if app.matched_at else None,
+                    })
+                except Exception:
+                    continue
+            return Response(result, status=200)
+        except Exception as e:
+            return Response({"detail": str(e)}, status=500)
+
+    @action(detail=False, methods=["post"], url_path="apply")
+    def apply(self, request):
+        """Create an application from a job seeker CV and job id.
+        Expects: { cv: <uuid>, job: <uuid> }
+        Optionally: { match_score: <number> }
+        """
+        cv_id = request.data.get("cv")
+        job_id = request.data.get("job")
+        match_score = request.data.get("match_score")
+        if not cv_id or not job_id:
+            return Response({"detail": "cv and job are required"}, status=400)
+        try:
+            cv = CV.objects.get(id=cv_id)
+            job = Job.objects.get(id=job_id)
+        except Exception:
+            return Response({"detail": "cv or job not found"}, status=404)
+
+        # Resolve company for the application: prefer direct mapping via job.company_id to companies.id
+        company_obj = None
+        try:
+            from .supabase_models import SbCompany  # local import to avoid cycles
+            raw_company_id = getattr(job, "company_id", None)
+            if raw_company_id is not None:
+                try:
+                    company_obj = SbCompany.objects.filter(id=raw_company_id).first()
+                except Exception:
+                    company_obj = None
+            if not company_obj and getattr(job, "company", None):
+                possible_names = []
+                comp_user = job.company
+                if hasattr(comp_user, "get_full_name"):
+                    n = comp_user.get_full_name()
+                    if n:
+                        possible_names.append(n)
+                for attr in ("full_name", "username", "email"):
+                    v = getattr(comp_user, attr, None)
+                    if v:
+                        possible_names.append(str(v))
+                if possible_names:
+                    company_obj = SbCompany.objects.filter(name__in=possible_names).first()
+        except Exception:
+            company_obj = None
+
+        try:
+            # If an application already exists for this cv+job, return it
+            existing = Application.objects.filter(cv=cv, job=job).first()
+            if existing:
+                return Response(self.get_serializer(existing).data, status=200)
+
+            # As a last resort, fallback to any available company to avoid blocking applies
+            if company_obj is None:
+                try:
+                    company_obj = SbCompany.objects.first()
+                except Exception:
+                    company_obj = None
+            app = Application.objects.create(
+                cv=cv,
+                job=job,
+                company=company_obj,
+                match_score=match_score,
+                matched_at=timezone.now(),
+            )
+        except Exception as e:
+            return Response({"detail": f"failed to create application: {e}"}, status=400)
+
+        return Response(self.get_serializer(app).data, status=201)
+
 
 class RecommendationViewSet(viewsets.ReadOnlyModelViewSet):
     queryset = Recommendation.objects.all()
@@ -291,7 +431,41 @@ class RAGSearchView(APIView):
             }, status=200)
             
         except Exception as e:
-            return Response({"detail": str(e)}, status=400)
+            # Fallback: simple text search to avoid 400s blocking the UI
+            try:
+                results = []
+                with connection.cursor() as c:
+                    c.execute(
+                        """
+                        SELECT id, title, description, requirements, company_id
+                        FROM jobs
+                        WHERE (title ILIKE %s OR description ILIKE %s OR requirements ILIKE %s)
+                        ORDER BY posted_at DESC
+                        LIMIT %s
+                        """,
+                        [f"%{query}%", f"%{query}%", f"%{query}%", max(1, top_n)],
+                    )
+                    row = c.fetchone()
+                    while row:
+                        results.append({
+                            "id": str(row[0]),
+                            "title": row[1],
+                            "description": row[2],
+                            "requirements": row[3],
+                            "company": str(row[4]) if row[4] is not None else None,
+                            "score": 0.0,
+                        })
+                        row = c.fetchone()
+                return Response({
+                    "query": query,
+                    "results": results,
+                    "summary": "",
+                    "total_matches": len(results),
+                    "similarity_threshold": similarity_threshold,
+                    "warning": f"Vector search failed ({str(e)}). Returned fallback text search results.",
+                }, status=200)
+            except Exception as e2:
+                return Response({"detail": f"search failed: {str(e)}; fallback failed: {str(e2)}"}, status=400)
 
 
 class CVMatchView(APIView):
@@ -303,7 +477,7 @@ class CVMatchView(APIView):
         cv_id = request.data.get("cv_id")
         cv_text = request.data.get("cv_text")
         top_n = int(request.data.get("top_n", 5))
-        similarity_threshold = float(request.data.get("similarity_threshold", 0.3))
+        similarity_threshold = float(request.data.get("similarity_threshold", 0.5))
         must_contain = request.data.get("must_contain") or []
         must_not_contain = request.data.get("must_not_contain") or []
 
@@ -715,10 +889,61 @@ class CVRecommendationsView(APIView):
 
         # Call Fireworks chat model to analyze and return structured JSON
         if not FIREWORKS_API_KEY:
+            # Free/demo fallback without external LLM: simple rule-based questioner
+            canned = [
+                "What is JavaScript, and how is it used in the browser?",
+                "Explain the difference between var, let, and const.",
+                "What is React reconciliation and why is it important?",
+                "How would you optimize a slow React app?",
+                "Describe an API you designed or integrated recently.",
+            ]
+            text_l = (user_text or "").lower()
+            if "change" in text_l or "another" in text_l or "different" in text_l:
+                assistant_text = random.choice(canned)
+            elif not history:
+                assistant_text = "Hi, thanks for coming in. What is JavaScript?"
+            else:
+                assistant_text = canned[(len(history) // 2) % len(canned)]
+
+            # TTS with gTTS fallback, then pyttsx3
+            audio_b64 = None
+            audio_mime = None
+            audio_error = None
+            try:
+                from gtts import gTTS
+                import io, base64 as _b64
+                tts = gTTS(text=assistant_text, lang='en')
+                buf = io.BytesIO()
+                tts.write_to_fp(buf)
+                audio_b64 = _b64.b64encode(buf.getvalue()).decode('utf-8')
+                audio_mime = 'audio/mpeg'
+            except Exception:
+                audio_b64 = None
+                audio_error = (audio_error or "") + " gtts_failed"
+            if audio_b64 is None:
+                try:
+                    import pyttsx3, tempfile, os
+                    engine = pyttsx3.init()
+                    fd, path = tempfile.mkstemp(suffix='.wav')
+                    os.close(fd)
+                    engine.save_to_file(assistant_text, path)
+                    engine.runAndWait()
+                    with open(path, 'rb') as fh:
+                        wav_bytes = fh.read()
+                    os.remove(path)
+                    audio_b64 = base64.b64encode(wav_bytes).decode('utf-8')
+                    audio_mime = 'audio/wav'
+                except Exception:
+                    audio_b64 = None
+                    audio_error = (audio_error or "") + " pyttsx3_failed"
+
             return Response({
-                "detail": "FIREWORKS_API_KEY is not set",
-                "hint": "Configure FIREWORKS_API_KEY in environment",
-            }, status=400)
+                "assistant_text": assistant_text,
+                "assistant_audio_base64": audio_b64,
+                "assistant_audio_mime": audio_mime,
+                "assistant_audio_error": audio_error,
+                "user_text": user_text,
+            }, status=200)
 
         system_prompt = (
             "You are an expert ATS resume analyzer. "
@@ -807,6 +1032,492 @@ class CVRecommendationsView(APIView):
             "analyzed_chars": len(text),
         }
         return Response(result, status=200)
+
+
+# ==================== VOICE CHAT (CONVERSATIONAL HR) ====================
+
+class VoiceChatTurnView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request):
+        """One conversational turn for HR voice chat.
+
+        Accepts either user text or audio, returns assistant (HR) reply as text and TTS audio (base64).
+
+        Body (multipart/form-data or JSON):
+          - audio_file (optional): user's recorded audio
+          - text (optional): user's text (if no audio)
+          - history (optional JSON): [{role: "system"|"user"|"assistant", content: str}, ...]
+          - job_description (optional)
+        """
+        user_text = request.data.get("text", "")
+        job_description = request.data.get("job_description", "")
+        audio_file = request.FILES.get("audio_file")
+
+        # Parse history if provided
+        history = []
+        try:
+            raw_history = request.data.get("history")
+            if raw_history:
+                if isinstance(raw_history, str):
+                    history = json.loads(raw_history)
+                elif isinstance(raw_history, list):
+                    history = raw_history
+        except Exception:
+            history = []
+
+        # STT if audio provided
+        if audio_file and not user_text:
+            openai_api_key = config("OPENAI_API_KEY", default=None)
+            if not openai_api_key:
+                return Response({"detail": "OPENAI_API_KEY not configured for STT"}, status=400)
+            try:
+                audio_file.seek(0)
+                whisper_url = "https://api.openai.com/v1/audio/transcriptions"
+                whisper_headers = {"Authorization": f"Bearer {openai_api_key}"}
+                whisper_files = {"file": (audio_file.name, audio_file, audio_file.content_type)}
+                whisper_data = {"model": "whisper-1", "response_format": "verbose_json"}
+                wr = requests.post(whisper_url, headers=whisper_headers, files=whisper_files, data=whisper_data, timeout=60)
+                if wr.ok:
+                    user_text = wr.json().get("text", "")
+                else:
+                    return Response({"detail": f"Whisper error: {wr.status_code}", "body": wr.text}, status=400)
+            except Exception as e:
+                return Response({"detail": f"STT failed: {e}"}, status=400)
+
+        if not user_text:
+            return Response({"detail": "Provide text or audio_file"}, status=400)
+
+        if not FIREWORKS_API_KEY:
+            return Response({
+                "detail": "FIREWORKS_API_KEY is not set",
+                "hint": "Configure FIREWORKS_API_KEY in environment",
+            }, status=400)
+
+        system_prompt = (
+            "You are an HR interviewer holding a natural voice interview. "
+            "Keep questions short and conversational. Respond based on the candidate's message. "
+            "If the candidate asks to change the question, provide a different relevant question."
+        )
+
+        messages = [{"role": "system", "content": system_prompt}]
+        # include job context once
+        if job_description:
+            messages.append({"role": "system", "content": f"Target job description: {job_description}"})
+        # append prior history (bounded)
+        for m in (history or [])[-10:]:
+            r = m.get("role")
+            c = m.get("content")
+            if r in ("system", "user", "assistant") and isinstance(c, str):
+                messages.append({"role": r, "content": c})
+        # latest user message
+        messages.append({"role": "user", "content": user_text})
+
+        try:
+            url = f"{FIREWORKS_BASE_URL}/chat/completions"
+            model_name = config("FIREWORKS_CHAT_MODEL", default="accounts/fireworks/models/llama-v3p1-70b-instruct")
+            headers = {"Authorization": f"Bearer {FIREWORKS_API_KEY}", "Content-Type": "application/json"}
+            payload = {"model": model_name, "messages": messages, "temperature": 0.6}
+            r = requests.post(url, headers=headers, json=payload, timeout=60)
+            if not r.ok:
+                return Response({"detail": f"Model error: {r.status_code}", "body": r.text}, status=400)
+            data = r.json()
+            assistant_text = data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+        except Exception as e:
+            return Response({"detail": f"Model call failed: {e}"}, status=400)
+
+        # TTS via ElevenLabs, fallback to gTTS (no key needed), then pyttsx3 (offline)
+        audio_b64 = None
+        audio_mime = None
+        elevenlabs_api_key = config("ELEVENLABS_API_KEY", default=None)
+        audio_error = None
+        if assistant_text:
+            if elevenlabs_api_key:
+                try:
+                    el_url = 'https://api.elevenlabs.io/v1/text-to-speech/pNInz6obpgDQGcFmaJgB'
+                    el_headers = {'Accept': 'audio/mpeg', 'Content-Type': 'application/json', 'xi-api-key': elevenlabs_api_key}
+                    el_data = {
+                        'text': assistant_text,
+                        'model_id': 'eleven_monolingual_v1',
+                        'voice_settings': {'stability': 0.5, 'similarity_boost': 0.5}
+                    }
+                    er = requests.post(el_url, headers=el_headers, json=el_data, timeout=30)
+                    if er.ok:
+                        audio_b64 = base64.b64encode(er.content).decode('utf-8')
+                        audio_mime = 'audio/mpeg'
+                except Exception:
+                    audio_b64 = None
+                    audio_error = (audio_error or "") + " elevenlabs_failed"
+            if audio_b64 is None:
+                try:
+                    from gtts import gTTS
+                    import io, base64 as _b64
+                    tts = gTTS(text=assistant_text, lang='en')
+                    buf = io.BytesIO()
+                    tts.write_to_fp(buf)
+                    audio_b64 = _b64.b64encode(buf.getvalue()).decode('utf-8')
+                    audio_mime = 'audio/mpeg'
+                except Exception:
+                    audio_b64 = None
+                    audio_error = (audio_error or "") + " gtts_failed"
+            if audio_b64 is None:
+                try:
+                    import pyttsx3, tempfile, os
+                    engine = pyttsx3.init()
+                    fd, path = tempfile.mkstemp(suffix='.wav')
+                    os.close(fd)
+                    engine.save_to_file(assistant_text, path)
+                    engine.runAndWait()
+                    with open(path, 'rb') as fh:
+                        wav_bytes = fh.read()
+                    os.remove(path)
+                    audio_b64 = base64.b64encode(wav_bytes).decode('utf-8')
+                    audio_mime = 'audio/wav'
+                except Exception:
+                    audio_b64 = None
+                    audio_error = (audio_error or "") + " pyttsx3_failed"
+
+        return Response({
+            "assistant_text": assistant_text,
+            "assistant_audio_base64": audio_b64,  # base64. See mime below
+            "assistant_audio_mime": audio_mime,
+            "assistant_audio_error": audio_error,
+            "user_text": user_text,
+        }, status=200)
+
+
+class VoiceChatEvaluateView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request):
+        """Evaluate a full voice-chat interview conversation.
+
+        Body (JSON):
+          - history: [{role: 'user'|'assistant', content: str}, ...]
+          - job_description (optional)
+        Returns JSON with overall_score, strengths, weaknesses, improvement_tips, summary.
+        """
+        try:
+            history = request.data.get("history") or []
+            job_description = request.data.get("job_description", "")
+            if not isinstance(history, list) or not history:
+                return Response({"detail": "history is required and must be non-empty"}, status=400)
+
+            # Build a transcript text
+            transcript_lines = []
+            for m in history[-50:]:  # limit to last 50 messages
+                role = m.get("role")
+                content = (m.get("content") or "").strip()
+                if not content:
+                    continue
+                who = "Candidate" if role == "user" else "Interviewer"
+                transcript_lines.append(f"{who}: {content}")
+            transcript = "\n".join(transcript_lines)
+
+            # If Fireworks unavailable, return heuristic result
+            if not FIREWORKS_API_KEY:
+                score = max(50, min(85, 60 + len(transcript) // 800))
+                return Response({
+                    "overall_score": score,
+                    "strengths": ["Clear communication"],
+                    "weaknesses": ["Needs more specific examples"],
+                    "improvement_tips": ["Use STAR method", "Quantify impact"],
+                    "summary": "Solid interview; add concrete metrics and deeper technical details."
+                }, status=200)
+
+            system_prompt = (
+                "You are a senior hiring manager. Evaluate the following interview transcript. "
+                "Return STRICT JSON with: overall_score (0-100), strengths (array), weaknesses (array), "
+                "improvement_tips (array), summary (string). Be concise and practical."
+            )
+            user_prompt = (
+                (f"Target Job Description:\n{job_description}\n\n" if job_description else "") +
+                f"Interview Transcript:\n{transcript}\n\n"
+                "Provide the JSON now."
+            )
+
+            url = f"{FIREWORKS_BASE_URL}/chat/completions"
+            model_name = config("FIREWORKS_CHAT_MODEL", default="accounts/fireworks/models/llama-v3p1-70b-instruct")
+            headers = {"Authorization": f"Bearer {FIREWORKS_API_KEY}", "Content-Type": "application/json"}
+            payload = {
+                "model": model_name,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                "temperature": 0.4,
+                "response_format": {"type": "json_object"},
+            }
+            r = requests.post(url, headers=headers, json=payload, timeout=60)
+            if not r.ok:
+                return Response({"detail": f"Model error: {r.status_code}", "body": r.text}, status=400)
+            data_resp = r.json()
+            content = data_resp.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+
+            def _parse_json(s: str):
+                try:
+                    return json.loads(s)
+                except Exception:
+                    m = re.search(r"\{[\s\S]*\}", s)
+                    return json.loads(m.group(0)) if m else None
+
+            data = _parse_json(content) or {}
+            result = {
+                "overall_score": max(0, min(100, int(data.get("overall_score", 0)))) if isinstance(data.get("overall_score"), (int, float, str)) else 0,
+                "strengths": data.get("strengths") or [],
+                "weaknesses": data.get("weaknesses") or [],
+                "improvement_tips": data.get("improvement_tips") or [],
+                "summary": data.get("summary", "") or data.get("detailed_feedback", "")
+            }
+            return Response(result, status=200)
+        except Exception as e:
+            return Response({"detail": f"Evaluation failed: {e}"}, status=400)
+
+
+# ==================== TECHNICAL VOICE CHAT ====================
+
+class TechVoiceChatTurnView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request):
+        user_text = request.data.get("text", "")
+        audio_file = request.FILES.get("audio_file")
+        job_description = request.data.get("job_description", "")
+        cv_id = request.data.get("cv_id")
+        cv_text = request.data.get("cv_text")
+        history = []
+        try:
+            raw_history = request.data.get("history")
+            if raw_history:
+                if isinstance(raw_history, str):
+                    history = json.loads(raw_history)
+                elif isinstance(raw_history, list):
+                    history = raw_history
+        except Exception:
+            history = []
+
+        # Resolve CV text if not provided (similar to InterviewQuestionsView)
+        if not cv_text:
+            try:
+                sb_user = SbUser.objects.get(email=request.user.email)
+                if cv_id:
+                    try:
+                        cv_obj = CV.objects.get(id=cv_id)
+                        cv_text = cv_obj.parsed_text or ""
+                    except CV.DoesNotExist:
+                        cv_text = ""
+                else:
+                    # Get latest CV if no cv_id provided
+                    latest_cv = CV.objects.filter(user_id=sb_user.id).order_by('-created_at').first()
+                    if latest_cv:
+                        cv_text = latest_cv.parsed_text or ""
+                    else:
+                        cv_text = ""
+            except SbUser.DoesNotExist:
+                cv_text = ""
+
+        # STT if audio
+        if audio_file and not user_text:
+            openai_api_key = config("OPENAI_API_KEY", default=None)
+            if not openai_api_key:
+                return Response({"detail": "OPENAI_API_KEY is not configured"}, status=400)
+            try:
+                audio_file.seek(0)
+                whisper_url = "https://api.openai.com/v1/audio/transcriptions"
+                whisper_headers = {"Authorization": f"Bearer {openai_api_key}"}
+                whisper_files = {"file": (audio_file.name, audio_file, audio_file.content_type)}
+                whisper_data = {"model": "whisper-1", "response_format": "verbose_json"}
+                wr = requests.post(whisper_url, headers=whisper_headers, files=whisper_files, data=whisper_data, timeout=60)
+                if wr.ok:
+                    user_text = wr.json().get("text", "")
+                else:
+                    return Response({"detail": f"Whisper error: {wr.status_code}", "body": wr.text}, status=400)
+            except Exception as e:
+                return Response({"detail": f"STT failed: {e}"}, status=400)
+
+        if not user_text:
+            return Response({"detail": "Provide text or audio_file"}, status=400)
+
+        # No Fireworks → rule-based tech questions
+        if not FIREWORKS_API_KEY:
+            canned = [
+                "What is a closure in JavaScript and why is it useful?",
+                "Explain Big-O for quicksort average and worst case.",
+                "What is ACID in databases?",
+                "How does React diff the virtual DOM?",
+                "Explain REST vs. GraphQL trade-offs."
+            ]
+            lt = (user_text or "").lower()
+            if "change" in lt or "another" in lt or "different" in lt:
+                assistant_text = random.choice(canned)
+            elif not history:
+                assistant_text = "Let's begin with a technical question: what is a closure in JavaScript?"
+            else:
+                assistant_text = canned[(len(history) // 2) % len(canned)]
+        else:
+            system_prompt = (
+                "You are a senior technical interviewer. Ask concise, precise technical questions. "
+                "Focus on fundamentals, code reasoning, complexity, system design, and real debugging scenarios. "
+                "If candidate requests a different question, switch topics."
+            )
+            messages = [{"role": "system", "content": system_prompt}]
+            
+            # Add CV context if available for personalized technical questions
+            if cv_text:
+                # Extract key technical info from CV (job title, skills, experience)
+                cv_context = f"Candidate Background:\n{cv_text[:2000]}"  # Limit to avoid token overflow
+                messages.append({"role": "system", "content": cv_context})
+            
+            if job_description:
+                messages.append({"role": "system", "content": f"Target job: {job_description}"})
+            for m in (history or [])[-10:]:
+                r = m.get("role")
+                c = m.get("content")
+                if r in ("system", "user", "assistant") and isinstance(c, str):
+                    messages.append({"role": r, "content": c})
+            messages.append({"role": "user", "content": user_text})
+
+            try:
+                url = f"{FIREWORKS_BASE_URL}/chat/completions"
+                model_name = config("FIREWORKS_CHAT_MODEL", default="accounts/fireworks/models/llama-v3p1-70b-instruct")
+                headers = {"Authorization": f"Bearer {FIREWORKS_API_KEY}", "Content-Type": "application/json"}
+                payload = {"model": model_name, "messages": messages, "temperature": 0.5}
+                r = requests.post(url, headers=headers, json=payload, timeout=60)
+                if not r.ok:
+                    return Response({"detail": f"Model error: {r.status_code}", "body": r.text}, status=400)
+                data = r.json()
+                assistant_text = data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+            except Exception as e:
+                return Response({"detail": f"Model call failed: {e}"}, status=400)
+
+        # TTS chain (same as HR)
+        audio_b64 = None
+        audio_mime = None
+        audio_error = None
+        elevenlabs_api_key = config("ELEVENLABS_API_KEY", default=None)
+        if assistant_text:
+            if elevenlabs_api_key:
+                try:
+                    el_url = 'https://api.elevenlabs.io/v1/text-to-speech/pNInz6obpgDQGcFmaJgB'
+                    el_headers = {'Accept': 'audio/mpeg', 'Content-Type': 'application/json', 'xi-api-key': elevenlabs_api_key}
+                    el_data = {'text': assistant_text, 'model_id': 'eleven_monolingual_v1', 'voice_settings': {'stability': 0.5, 'similarity_boost': 0.5}}
+                    er = requests.post(el_url, headers=el_headers, json=el_data, timeout=30)
+                    if er.ok:
+                        audio_b64 = base64.b64encode(er.content).decode('utf-8')
+                        audio_mime = 'audio/mpeg'
+                except Exception:
+                    audio_error = (audio_error or "") + " elevenlabs_failed"
+            if audio_b64 is None:
+                try:
+                    from gtts import gTTS
+                    import io, base64 as _b64
+                    buf = io.BytesIO()
+                    gTTS(text=assistant_text, lang='en').write_to_fp(buf)
+                    audio_b64 = _b64.b64encode(buf.getvalue()).decode('utf-8')
+                    audio_mime = 'audio/mpeg'
+                except Exception:
+                    audio_error = (audio_error or "") + " gtts_failed"
+            if audio_b64 is None:
+                try:
+                    import pyttsx3, tempfile, os
+                    engine = pyttsx3.init()
+                    fd, path = tempfile.mkstemp(suffix='.wav')
+                    os.close(fd)
+                    engine.save_to_file(assistant_text, path)
+                    engine.runAndWait()
+                    with open(path, 'rb') as fh:
+                        wav_bytes = fh.read()
+                    os.remove(path)
+                    audio_b64 = base64.b64encode(wav_bytes).decode('utf-8')
+                    audio_mime = 'audio/wav'
+                except Exception:
+                    audio_error = (audio_error or "") + " pyttsx3_failed"
+
+        return Response({
+            "assistant_text": assistant_text,
+            "assistant_audio_base64": audio_b64,
+            "assistant_audio_mime": audio_mime,
+            "assistant_audio_error": audio_error,
+            "user_text": user_text,
+        }, status=200)
+
+
+class TechVoiceChatEvaluateView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request):
+        history = request.data.get("history") or []
+        job_description = request.data.get("job_description", "")
+        if not isinstance(history, list) or not history:
+            return Response({"detail": "history is required and must be non-empty"}, status=400)
+
+        # Fetch CV text for context
+        cv_text = ""
+        try:
+            sb_user = SbUser.objects.get(email=request.user.email)
+            latest_cv = CV.objects.filter(user_id=sb_user.id).order_by('-created_at').first()
+            if latest_cv:
+                cv_text = latest_cv.parsed_text or ""
+        except SbUser.DoesNotExist:
+            pass
+
+        transcript_lines = []
+        for m in history[-50:]:
+            role = m.get("role")
+            content = (m.get("content") or "").strip()
+            if not content:
+                continue
+            who = "Candidate" if role == "user" else "Interviewer"
+            transcript_lines.append(f"{who}: {content}")
+        transcript = "\n".join(transcript_lines)
+
+        if not FIREWORKS_API_KEY:
+            score = max(50, min(90, 65 + len(transcript) // 700))
+            return Response({
+                "overall_score": score,
+                "strengths": ["Good grasp of fundamentals"],
+                "weaknesses": ["Needs deeper complexity analysis"],
+                "improvement_tips": ["State Big-O clearly", "Compare trade-offs"],
+                "summary": "Solid technical discussion. Focus on complexity and concrete designs."
+            }, status=200)
+
+        system_prompt = (
+            "You are a senior engineering interviewer. Evaluate the technical interview transcript focusing on technical depth, correctness, complexity analysis, and design trade-offs. "
+            "Return STRICT JSON: overall_score (0-100), strengths, weaknesses, improvement_tips, summary."
+        )
+        user_prompt = ""
+        if cv_text:
+            user_prompt += f"Candidate Background:\n{cv_text[:1500]}\n\n"  # Limit CV context
+        if job_description:
+            user_prompt += f"Target Job Description:\n{job_description}\n\n"
+        user_prompt += f"Interview Transcript:\n{transcript}\n\nProvide the JSON now."
+        try:
+            url = f"{FIREWORKS_BASE_URL}/chat/completions"
+            model_name = config("FIREWORKS_CHAT_MODEL", default="accounts/fireworks/models/llama-v3p1-70b-instruct")
+            headers = {"Authorization": f"Bearer {FIREWORKS_API_KEY}", "Content-Type": "application/json"}
+            payload = {"model": model_name, "messages": [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}], "temperature": 0.4, "response_format": {"type": "json_object"}}
+            r = requests.post(url, headers=headers, json=payload, timeout=60)
+            if not r.ok:
+                return Response({"detail": f"Model error: {r.status_code}", "body": r.text}, status=400)
+            data_resp = r.json()
+            content = data_resp.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+            def _parse_json(s: str):
+                try:
+                    return json.loads(s)
+                except Exception:
+                    m = re.search(r"\{[\s\S]*\}", s)
+                    return json.loads(m.group(0)) if m else None
+            data = _parse_json(content) or {}
+            result = {
+                "overall_score": max(0, min(100, int(float(data.get("overall_score", 0))))) if str(data.get("overall_score", "")).strip() != "" else 0,
+                "strengths": data.get("strengths") or [],
+                "weaknesses": data.get("weaknesses") or [],
+                "improvement_tips": data.get("improvement_tips") or [],
+                "summary": data.get("summary", "") or data.get("detailed_feedback", "")
+            }
+            return Response(result, status=200)
+        except Exception as e:
+            return Response({"detail": f"Evaluation failed: {e}"}, status=400)
 
 
 class DashboardView(APIView):

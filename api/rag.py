@@ -156,7 +156,7 @@ def embed_text(text: str) -> List[float]:
     return embed_text_openai(text)
 
 
-def search_similar_jobs(embedding: List[float], top_n: int = 10, similarity_threshold: float = 0.3) -> List[Tuple]:
+def search_similar_jobs(embedding: List[float], top_n: int = 10, similarity_threshold: float = 0.5) -> List[Tuple]:
     """
     Search for similar jobs using cosine similarity with pgvector.
     """
@@ -243,7 +243,7 @@ def embed_text(text: str) -> List[float]:
     return embed_text_openai(text)
 
 
-def search_similar_jobs(embedding: List[float], top_n: int = 10, similarity_threshold: float = 0.3) -> List[Tuple]:
+def search_similar_jobs(embedding: List[float], top_n: int = 10, similarity_threshold: float = 0.5) -> List[Tuple]:
     """
     Search for similar jobs using cosine similarity with pgvector.
     

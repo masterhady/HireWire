@@ -34,6 +34,10 @@ from .supabase_views import (
     AudioInterviewEvaluationView,
     AudioInterviewSessionEvaluationsView,
     AudioInterviewHistoryView,
+    VoiceChatTurnView,
+    VoiceChatEvaluateView,
+    TechVoiceChatTurnView,
+    TechVoiceChatEvaluateView,
 )
 
 router = DefaultRouter()
@@ -73,5 +77,10 @@ urlpatterns = [
     path("audio-interview/evaluation/<uuid:answer_id>/", AudioInterviewEvaluationView.as_view(), name="audio_interview_evaluation"),
     path("audio-interview/session/<uuid:session_id>/evaluations/", AudioInterviewSessionEvaluationsView.as_view(), name="audio_interview_session_evaluations"),
     path("audio-interview/history/", AudioInterviewHistoryView.as_view(), name="audio_interview_history"),
+    # Voice chat (conversational HR)
+    path("voice-chat/turn/", VoiceChatTurnView.as_view(), name="voice_chat_turn"),
+    path("voice-chat/evaluate/", VoiceChatEvaluateView.as_view(), name="voice_chat_evaluate"),
+    path("tech-voice-chat/turn/", TechVoiceChatTurnView.as_view(), name="tech_voice_chat_turn"),
+    path("tech-voice-chat/evaluate/", TechVoiceChatEvaluateView.as_view(), name="tech_voice_chat_evaluate"),
     path("", include(router.urls)),
 ]

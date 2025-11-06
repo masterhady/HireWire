@@ -52,9 +52,35 @@ class CVEmbeddingSerializer(serializers.ModelSerializer):
 
 
 class JobSerializer(serializers.ModelSerializer):
+    company_display = serializers.SerializerMethodField()
+
     class Meta:
         model = Job
         fields = "__all__"
+        extra_fields = ["company_display"]
+
+    def get_company_display(self, obj):
+        # Try to derive a human-friendly company label from the AUTH_USER related object
+        try:
+            user = getattr(obj, "company", None)
+            if not user:
+                return None
+            # Prefer full name or username/email if available
+            for attr in ["get_full_name", "full_name"]:
+                val = getattr(user, attr, None)
+                if callable(val):
+                    name = val()
+                    if name:
+                        return name
+                elif val:
+                    return val
+            if getattr(user, "username", None):
+                return user.username
+            if getattr(user, "email", None):
+                return user.email
+        except Exception:
+            pass
+        return None
 
 
 class JobEmbeddingSerializer(serializers.ModelSerializer):
@@ -65,9 +91,32 @@ class JobEmbeddingSerializer(serializers.ModelSerializer):
 
 
 class ApplicationSerializer(serializers.ModelSerializer):
+    job_title = serializers.SerializerMethodField()
+    company_name = serializers.SerializerMethodField()
+    cv_filename = serializers.SerializerMethodField()
+
     class Meta:
         model = Application
         fields = "__all__"
+        extra_fields = ["job_title", "company_name", "cv_filename"]
+
+    def get_job_title(self, obj):
+        try:
+            return getattr(obj.job, "title", None)
+        except Exception:
+            return None
+
+    def get_company_name(self, obj):
+        try:
+            return getattr(obj.company, "name", None)
+        except Exception:
+            return None
+
+    def get_cv_filename(self, obj):
+        try:
+            return getattr(obj.cv, "filename", None)
+        except Exception:
+            return None
 
 
 class RecommendationSerializer(serializers.ModelSerializer):

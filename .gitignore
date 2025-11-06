@@ -7,7 +7,7 @@ __pycache__/
 # Virtual environments
 venv/
 .env/
-
+.env
 # Django stuff
 db.sqlite3
 *.log

@@ -61,8 +61,165 @@ import base64
 import random
 import json
 import requests
+from bs4 import BeautifulSoup
+from urllib.parse import urljoin
 
 EMB_DIM = config("FIREWORKS_EMBEDDING_DIM", default=None, cast=int)
+
+
+def search_maharatech_courses(skill_name: str, max_results: int = 3) -> list:
+    """
+    Search for courses on MaharaTech (maharatech.gov.eg) related to a skill.
+    Returns a list of course dictionaries with 'title' and 'url' keys.
+    If no courses are found, returns an empty list.
+    """
+    try:
+        base_url = "https://maharatech.gov.eg"
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9,ar;q=0.8",
+        }
+        courses = []
+        
+        # Try multiple search approaches
+        search_urls = [
+            f"{base_url}/course/search.php",
+            f"{base_url}/search/index.php",
+        ]
+        
+        for search_url in search_urls:
+            try:
+                # Prepare search parameters for Moodle
+                search_params = {
+                    "q": skill_name,
+                }
+                
+                # Try with areaids parameter (Moodle-specific)
+                response = requests.get(
+                    search_url,
+                    params={**search_params, "areaids": "core_course-course"},
+                    headers=headers,
+                    timeout=10,
+                    allow_redirects=True
+                )
+                
+                if not response.ok:
+                    # Try without areaids
+                    response = requests.get(
+                        search_url,
+                        params=search_params,
+                        headers=headers,
+                        timeout=10,
+                        allow_redirects=True
+                    )
+                
+                if not response.ok:
+                    continue
+                
+                # Parse HTML
+                soup = BeautifulSoup(response.content, 'lxml')
+                
+                # Method 1: Look for course links in search results
+                # Moodle course links typically contain '/course/view.php?id=' or '/course/'
+                course_links = soup.find_all('a', href=re.compile(r'/course/(view\.php|index\.php)'))
+                
+                for link in course_links:
+                    href = link.get('href', '')
+                    title = link.get_text(strip=True)
+                    
+                    # Clean up title - get text from link or parent elements
+                    if not title or len(title) < 5:
+                        # Try to get title from parent or sibling elements
+                        parent = link.find_parent(['div', 'li', 'article', 'section'])
+                        if parent:
+                            title_elem = parent.find(['h1', 'h2', 'h3', 'h4', 'span', 'div'], class_=re.compile(r'title|name|course'))
+                            if title_elem:
+                                title = title_elem.get_text(strip=True)
+                    
+                    if title and len(title) > 5:
+                        # Make URL absolute
+                        course_url = urljoin(base_url, href) if not href.startswith('http') else href
+                        
+                        # Ensure URL is from MaharaTech domain only
+                        if 'maharatech.gov.eg' not in course_url:
+                            continue
+                        
+                        # Avoid duplicates and filter out non-course pages
+                        if (course_url not in [c['url'] for c in courses] and 
+                            ('/course/view.php?id=' in course_url or '/course/index.php' in course_url)):
+                            courses.append({
+                                'title': title[:200],  # Limit title length
+                                'url': course_url
+                            })
+                            
+                            if len(courses) >= max_results:
+                                break
+                
+                # Method 2: Look for course cards/containers
+                if len(courses) < max_results:
+                    course_containers = soup.find_all(['div', 'article', 'li'], 
+                                                      class_=re.compile(r'course|result|item|card'),
+                                                      attrs={'data-courseid': True})
+                    
+                    for container in course_containers:
+                        link = container.find('a', href=re.compile(r'course'))
+                        if not link:
+                            continue
+                        
+                        href = link.get('href', '')
+                        title = link.get_text(strip=True)
+                        
+                        # Try to find title in container
+                        if not title or len(title) < 5:
+                            title_elem = container.find(['h1', 'h2', 'h3', 'h4'], 
+                                                       class_=re.compile(r'title|name'))
+                            if title_elem:
+                                title = title_elem.get_text(strip=True)
+                        
+                        if title and len(title) > 5:
+                            course_url = urljoin(base_url, href) if not href.startswith('http') else href
+                            
+                            # Ensure URL is from MaharaTech domain only
+                            if 'maharatech.gov.eg' not in course_url:
+                                continue
+                            
+                            if (course_url not in [c['url'] for c in courses] and 
+                                '/course/' in course_url):
+                                courses.append({
+                                    'title': title[:200],
+                                    'url': course_url
+                                })
+                                
+                                if len(courses) >= max_results:
+                                    break
+                
+                # If we found courses, break out of the loop
+                if courses:
+                    break
+                    
+            except Exception as e:
+                # Continue to next search URL if this one fails
+                continue
+        
+        # Filter and clean results
+        unique_courses = []
+        seen_urls = set()
+        for course in courses:
+            if course['url'] not in seen_urls:
+                seen_urls.add(course['url'])
+                unique_courses.append(course)
+                if len(unique_courses) >= max_results:
+                    break
+        
+        return unique_courses[:max_results]
+        
+    except Exception as e:
+        # Log error but don't fail the request - return empty list
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.warning(f"Error searching MaharaTech for '{skill_name}': {e}")
+        return []
 
 
 class CompanyViewSet(viewsets.ModelViewSet):
@@ -1757,10 +1914,23 @@ class CareerAdvisorView(APIView):
             }, status=400)
 
         # Normalize response defensively
+        skills_gaps = data.get("skills_gaps") or []
+        
+        # Search for MaharaTech courses for each skill gap
+        skill_courses = []
+        for skill in skills_gaps:
+            courses = search_maharatech_courses(skill, max_results=3)
+            if courses:  # Only add if courses are found
+                skill_courses.append({
+                    "skill": skill,
+                    "courses": courses
+                })
+        
         result = {
             "current_role_assessment": data.get("current_role_assessment", ""),
             "career_paths": data.get("career_paths") or [],
-            "skills_gaps": data.get("skills_gaps") or [],
+            "skills_gaps": skills_gaps,
+            "skill_courses": skill_courses,  # New field with course suggestions
             "market_demand": data.get("market_demand") or [],
             "recommendations": data.get("recommendations") or [],
             "next_steps": data.get("next_steps") or [],

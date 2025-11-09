@@ -8,6 +8,8 @@ from .supabase_models import (
     Job,
     JobEmbedding,
     Application,
+    ApplicationStatus,
+    ApplicationNote,
     Recommendation,
     InterviewSession,
     InterviewQuestion,
@@ -94,11 +96,14 @@ class ApplicationSerializer(serializers.ModelSerializer):
     job_title = serializers.SerializerMethodField()
     company_name = serializers.SerializerMethodField()
     cv_filename = serializers.SerializerMethodField()
+    current_status = serializers.SerializerMethodField()
+    status_history = serializers.SerializerMethodField()
+    notes_count = serializers.SerializerMethodField()
 
     class Meta:
         model = Application
         fields = "__all__"
-        extra_fields = ["job_title", "company_name", "cv_filename"]
+        extra_fields = ["job_title", "company_name", "cv_filename", "current_status", "status_history", "notes_count"]
 
     def get_job_title(self, obj):
         try:
@@ -117,6 +122,56 @@ class ApplicationSerializer(serializers.ModelSerializer):
             return getattr(obj.cv, "filename", None)
         except Exception:
             return None
+    
+    def get_current_status(self, obj):
+        try:
+            latest_status = ApplicationStatus.objects.filter(application=obj).first()
+            if latest_status:
+                return {
+                    'status': latest_status.status,
+                    'status_display': latest_status.get_status_display(),
+                    'updated_at': latest_status.updated_at.isoformat() if latest_status.updated_at else None,
+                }
+        except Exception:
+            pass
+        return {'status': 'applied', 'status_display': 'Applied', 'updated_at': None}
+    
+    def get_status_history(self, obj):
+        try:
+            statuses = ApplicationStatus.objects.filter(application=obj).order_by('-created_at')[:10]
+            return [
+                {
+                    'status': s.status,
+                    'status_display': s.get_status_display(),
+                    'notes': s.notes,
+                    'created_at': s.created_at.isoformat() if s.created_at else None,
+                }
+                for s in statuses
+            ]
+        except Exception:
+            return []
+    
+    def get_notes_count(self, obj):
+        try:
+            return ApplicationNote.objects.filter(application=obj).count()
+        except Exception:
+            return 0
+
+
+class ApplicationStatusSerializer(serializers.ModelSerializer):
+    status_display = serializers.CharField(source='get_status_display', read_only=True)
+    
+    class Meta:
+        model = ApplicationStatus
+        fields = "__all__"
+        read_only_fields = ['id', 'created_at', 'updated_at']
+
+
+class ApplicationNoteSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ApplicationNote
+        fields = "__all__"
+        read_only_fields = ['id', 'created_at', 'updated_at']
 
 
 class RecommendationSerializer(serializers.ModelSerializer):

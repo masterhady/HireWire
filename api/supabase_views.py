@@ -18,6 +18,8 @@ from .supabase_models import (
     Job,
     JobEmbedding,
     Application,
+    ApplicationStatus,
+    ApplicationNote,
     Recommendation,
     InterviewSession,
     InterviewQuestion,
@@ -37,6 +39,8 @@ from .supabase_serializers import (
     JobSerializer,
     JobEmbeddingSerializer,
     ApplicationSerializer,
+    ApplicationStatusSerializer,
+    ApplicationNoteSerializer,
     RecommendationSerializer,
     InterviewSessionSerializer,
     InterviewQuestionSerializer,
@@ -414,6 +418,188 @@ class ApplicationViewSet(viewsets.ModelViewSet):
         except Exception as e:
             return Response({"detail": str(e)}, status=500)
 
+    @action(detail=False, methods=["get"], url_path="tracking/my-applications")
+    def my_applications(self, request):
+        """Get all applications for the current user (job seeker) with tracking info."""
+        if not request.user.is_authenticated:
+            return Response({"detail": "Authentication required"}, status=401)
+        
+        try:
+            # Get user's CVs
+            auth_email = getattr(request.user, "email", None)
+            if not auth_email:
+                return Response({"detail": "User email not found"}, status=400)
+            
+            sb_user = SbUser.objects.filter(email=auth_email).first()
+            if not sb_user:
+                return Response({"detail": "Supabase user not found"}, status=404)
+            
+            # Get applications for user's CVs
+            applications = Application.objects.filter(cv__user_id=sb_user.id).order_by('-matched_at')
+            
+            # Filter by status if provided
+            status_filter = request.query_params.get('status')
+            if status_filter:
+                application_ids = ApplicationStatus.objects.filter(
+                    status=status_filter
+                ).values_list('application_id', flat=True).distinct()
+                applications = applications.filter(id__in=application_ids)
+            
+            serializer = ApplicationSerializer(applications, many=True)
+            return Response(serializer.data, status=200)
+        except Exception as e:
+            return Response({"detail": str(e)}, status=500)
+
+    @action(detail=True, methods=["post"], url_path="tracking/update-status")
+    def update_status(self, request, pk=None):
+        """Update application status. Only companies can update status."""
+        if not request.user.is_authenticated:
+            return Response({"detail": "Authentication required"}, status=401)
+        
+        try:
+            application = self.get_object()
+            
+            # Check if user is the company that posted the job
+            # Only companies can update application status
+            if application.job.company != request.user:
+                return Response({
+                    "detail": "Only the company that posted this job can update application status"
+                }, status=403)
+            
+            status = request.data.get('status')
+            notes = request.data.get('notes', '')
+            
+            if not status:
+                return Response({"detail": "Status is required"}, status=400)
+            
+            # Create new status entry
+            status_obj = ApplicationStatus.objects.create(
+                application=application,
+                status=status,
+                notes=notes
+            )
+            
+            serializer = ApplicationStatusSerializer(status_obj)
+            return Response(serializer.data, status=201)
+        except Application.DoesNotExist:
+            return Response({"detail": "Application not found"}, status=404)
+        except Exception as e:
+            return Response({"detail": str(e)}, status=500)
+
+    @action(detail=True, methods=["post"], url_path="tracking/add-note")
+    def add_note(self, request, pk=None):
+        """Add a note to an application."""
+        if not request.user.is_authenticated:
+            return Response({"detail": "Authentication required"}, status=401)
+        
+        try:
+            application = self.get_object()
+            note_text = request.data.get('note')
+            
+            if not note_text:
+                return Response({"detail": "Note is required"}, status=400)
+            
+            note = ApplicationNote.objects.create(
+                application=application,
+                note=note_text
+            )
+            
+            serializer = ApplicationNoteSerializer(note)
+            return Response(serializer.data, status=201)
+        except Application.DoesNotExist:
+            return Response({"detail": "Application not found"}, status=404)
+        except Exception as e:
+            return Response({"detail": str(e)}, status=500)
+
+    @action(detail=True, methods=["get"], url_path="tracking/notes")
+    def get_notes(self, request, pk=None):
+        """Get all notes for an application."""
+        if not request.user.is_authenticated:
+            return Response({"detail": "Authentication required"}, status=401)
+        
+        try:
+            application = self.get_object()
+            notes = ApplicationNote.objects.filter(application=application).order_by('-created_at')
+            serializer = ApplicationNoteSerializer(notes, many=True)
+            return Response(serializer.data, status=200)
+        except Application.DoesNotExist:
+            return Response({"detail": "Application not found"}, status=404)
+        except Exception as e:
+            return Response({"detail": str(e)}, status=500)
+
+    @action(detail=True, methods=["get"], url_path="tracking/timeline")
+    def get_timeline(self, request, pk=None):
+        """Get timeline of status changes and notes for an application."""
+        if not request.user.is_authenticated:
+            return Response({"detail": "Authentication required"}, status=401)
+        
+        try:
+            application = self.get_object()
+            timeline = []
+            
+            # Get status history
+            statuses = ApplicationStatus.objects.filter(application=application).order_by('-created_at')
+            for status in statuses:
+                timeline.append({
+                    'type': 'status',
+                    'status': status.status,
+                    'status_display': status.get_status_display(),
+                    'notes': status.notes,
+                    'created_at': status.created_at.isoformat() if status.created_at else None,
+                })
+            
+            # Get notes
+            notes = ApplicationNote.objects.filter(application=application).order_by('-created_at')
+            for note in notes:
+                timeline.append({
+                    'type': 'note',
+                    'note': note.note,
+                    'created_at': note.created_at.isoformat() if note.created_at else None,
+                })
+            
+            # Sort by created_at (most recent first)
+            timeline.sort(key=lambda x: x.get('created_at', ''), reverse=True)
+            
+            return Response(timeline, status=200)
+        except Application.DoesNotExist:
+            return Response({"detail": "Application not found"}, status=404)
+        except Exception as e:
+            return Response({"detail": str(e)}, status=500)
+
+    @action(detail=False, methods=["get"], url_path="tracking/statistics")
+    def get_statistics(self, request):
+        """Get application statistics for the current user."""
+        if not request.user.is_authenticated:
+            return Response({"detail": "Authentication required"}, status=401)
+        
+        try:
+            # Get user's CVs
+            auth_email = getattr(request.user, "email", None)
+            if not auth_email:
+                return Response({"detail": "User email not found"}, status=400)
+            
+            sb_user = SbUser.objects.filter(email=auth_email).first()
+            if not sb_user:
+                return Response({"detail": "Supabase user not found"}, status=404)
+            
+            # Get applications for user's CVs
+            applications = Application.objects.filter(cv__user_id=sb_user.id)
+            total_applications = applications.count()
+            
+            # Get status counts
+            status_counts = {}
+            for app in applications:
+                latest_status = ApplicationStatus.objects.filter(application=app).first()
+                status = latest_status.status if latest_status else 'applied'
+                status_counts[status] = status_counts.get(status, 0) + 1
+            
+            return Response({
+                'total_applications': total_applications,
+                'status_counts': status_counts,
+            }, status=200)
+        except Exception as e:
+            return Response({"detail": str(e)}, status=500)
+
     @action(detail=False, methods=["post"], url_path="apply")
     def apply(self, request):
         """Create an application from a job seeker CV and job id.
@@ -461,6 +647,13 @@ class ApplicationViewSet(viewsets.ModelViewSet):
             # If an application already exists for this cv+job, return it
             existing = Application.objects.filter(cv=cv, job=job).first()
             if existing:
+                # Ensure initial status exists
+                if not ApplicationStatus.objects.filter(application=existing).exists():
+                    ApplicationStatus.objects.create(
+                        application=existing,
+                        status='applied',
+                        notes='Application created'
+                    )
                 return Response(self.get_serializer(existing).data, status=200)
 
             # As a last resort, fallback to any available company to avoid blocking applies
@@ -475,6 +668,13 @@ class ApplicationViewSet(viewsets.ModelViewSet):
                 company=company_obj,
                 match_score=match_score,
                 matched_at=timezone.now(),
+            )
+            
+            # Create initial status
+            ApplicationStatus.objects.create(
+                application=app,
+                status='applied',
+                notes='Application submitted'
             )
         except Exception as e:
             return Response({"detail": f"failed to create application: {e}"}, status=400)

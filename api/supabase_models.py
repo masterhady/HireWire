@@ -112,6 +112,47 @@ class Application(models.Model):
         db_table = "applications"
 
 
+# Application Tracking Models (Django-managed for new features)
+class ApplicationStatus(models.Model):
+    """Tracks application status changes"""
+    STATUS_CHOICES = [
+        ('applied', 'Applied'),
+        ('viewed', 'Viewed'),
+        ('screening', 'Screening'),
+        ('interview', 'Interview'),
+        ('interviewing', 'Interviewing'),
+        ('offer', 'Offer'),
+        ('rejected', 'Rejected'),
+        ('withdrawn', 'Withdrawn'),
+        ('accepted', 'Accepted'),
+    ]
+    
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    application = models.ForeignKey(Application, models.DO_NOTHING, db_column="application_id", related_name="statuses")
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='applied')
+    notes = models.TextField(blank=True, null=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    
+    class Meta:
+        db_table = "application_statuses"
+        ordering = ['-created_at']
+        get_latest_by = 'created_at'
+
+
+class ApplicationNote(models.Model):
+    """Stores notes for applications"""
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    application = models.ForeignKey(Application, models.DO_NOTHING, db_column="application_id", related_name="notes")
+    note = models.TextField()
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    
+    class Meta:
+        db_table = "application_notes"
+        ordering = ['-created_at']
+
+
 class Recommendation(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     application = models.ForeignKey(Application, models.DO_NOTHING, db_column="application_id")

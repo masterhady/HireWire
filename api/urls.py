@@ -14,6 +14,7 @@ from .supabase_views import (
     JobEmbeddingViewSet,
     ApplicationViewSet,
     RecommendationViewSet,
+    CoverLetterViewSet,
     RAGSearchView,
     CVMatchView,
     CVUploadView,
@@ -50,6 +51,7 @@ router.register(r"jobs", JobViewSet, basename="jobs")
 router.register(r"job-embeddings", JobEmbeddingViewSet, basename="job-embeddings")
 router.register(r"applications", ApplicationViewSet, basename="applications")
 router.register(r"recommendations", RecommendationViewSet, basename="recommendations")
+router.register(r"cover-letters", CoverLetterViewSet, basename="cover-letters")
 
 urlpatterns = [
     path("auth/register/", RegisterView.as_view(), name="auth_register"),

@@ -10,6 +10,8 @@ from .supabase_models import (
     Application,
     ApplicationStatus,
     ApplicationNote,
+    CoverLetter,
+    ApplicationCoverLetter,
     Recommendation,
     InterviewSession,
     InterviewQuestion,
@@ -99,11 +101,12 @@ class ApplicationSerializer(serializers.ModelSerializer):
     current_status = serializers.SerializerMethodField()
     status_history = serializers.SerializerMethodField()
     notes_count = serializers.SerializerMethodField()
+    cover_letter = serializers.SerializerMethodField()
 
     class Meta:
         model = Application
         fields = "__all__"
-        extra_fields = ["job_title", "company_name", "cv_filename", "current_status", "status_history", "notes_count"]
+        extra_fields = ["job_title", "company_name", "cv_filename", "current_status", "status_history", "notes_count", "cover_letter"]
 
     def get_job_title(self, obj):
         try:
@@ -156,6 +159,21 @@ class ApplicationSerializer(serializers.ModelSerializer):
             return ApplicationNote.objects.filter(application=obj).count()
         except Exception:
             return 0
+    
+    def get_cover_letter(self, obj):
+        try:
+            app_cover_letter = ApplicationCoverLetter.objects.filter(application=obj).first()
+            if app_cover_letter:
+                cover_letter = app_cover_letter.cover_letter
+                return {
+                    'id': str(cover_letter.id),
+                    'version_name': cover_letter.version_name,
+                    'cover_letter_text': cover_letter.cover_letter_text,
+                    'created_at': cover_letter.created_at.isoformat() if cover_letter.created_at else None,
+                }
+        except Exception:
+            pass
+        return None
 
 
 class ApplicationStatusSerializer(serializers.ModelSerializer):
@@ -172,6 +190,30 @@ class ApplicationNoteSerializer(serializers.ModelSerializer):
         model = ApplicationNote
         fields = "__all__"
         read_only_fields = ['id', 'created_at', 'updated_at']
+
+
+class CoverLetterSerializer(serializers.ModelSerializer):
+    job_title = serializers.SerializerMethodField()
+    company_name = serializers.SerializerMethodField()
+    
+    class Meta:
+        model = CoverLetter
+        fields = "__all__"
+        read_only_fields = ['id', 'created_at', 'updated_at']
+    
+    def get_job_title(self, obj):
+        try:
+            return getattr(obj.job, "title", None) if obj.job else None
+        except Exception:
+            return None
+    
+    def get_company_name(self, obj):
+        try:
+            if obj.job and obj.job.company:
+                return getattr(obj.job.company, "name", None)
+        except Exception:
+            pass
+        return None
 
 
 class RecommendationSerializer(serializers.ModelSerializer):

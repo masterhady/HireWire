@@ -20,6 +20,8 @@ from .supabase_models import (
     Application,
     ApplicationStatus,
     ApplicationNote,
+    CoverLetter,
+    ApplicationCoverLetter,
     Recommendation,
     InterviewSession,
     InterviewQuestion,
@@ -41,6 +43,7 @@ from .supabase_serializers import (
     ApplicationSerializer,
     ApplicationStatusSerializer,
     ApplicationNoteSerializer,
+    CoverLetterSerializer,
     RecommendationSerializer,
     InterviewSessionSerializer,
     InterviewQuestionSerializer,
@@ -604,11 +607,12 @@ class ApplicationViewSet(viewsets.ModelViewSet):
     def apply(self, request):
         """Create an application from a job seeker CV and job id.
         Expects: { cv: <uuid>, job: <uuid> }
-        Optionally: { match_score: <number> }
+        Optionally: { match_score: <number>, cover_letter_id: <uuid> }
         """
         cv_id = request.data.get("cv")
         job_id = request.data.get("job")
         match_score = request.data.get("match_score")
+        cover_letter_id = request.data.get("cover_letter_id")
         if not cv_id or not job_id:
             return Response({"detail": "cv and job are required"}, status=400)
         try:
@@ -654,6 +658,25 @@ class ApplicationViewSet(viewsets.ModelViewSet):
                         status='applied',
                         notes='Application created'
                     )
+                # Attach cover letter if provided and not already attached
+                if cover_letter_id:
+                    try:
+                        cover_letter = CoverLetter.objects.get(id=cover_letter_id)
+                        # Verify the cover letter belongs to the same user
+                        auth_user = getattr(request, "user", None)
+                        auth_email = getattr(auth_user, "email", None)
+                        sb_user = None
+                        if auth_email:
+                            sb_user = SbUser.objects.filter(email=auth_email).first()
+                        if sb_user and cover_letter.user_id == sb_user.id:
+                            ApplicationCoverLetter.objects.get_or_create(
+                                application=existing,
+                                cover_letter=cover_letter
+                            )
+                    except CoverLetter.DoesNotExist:
+                        pass
+                    except Exception:
+                        pass
                 return Response(self.get_serializer(existing).data, status=200)
 
             # As a last resort, fallback to any available company to avoid blocking applies
@@ -676,6 +699,26 @@ class ApplicationViewSet(viewsets.ModelViewSet):
                 status='applied',
                 notes='Application submitted'
             )
+            
+            # Attach cover letter if provided
+            if cover_letter_id:
+                try:
+                    cover_letter = CoverLetter.objects.get(id=cover_letter_id)
+                    # Verify the cover letter belongs to the same user
+                    auth_user = getattr(request, "user", None)
+                    auth_email = getattr(auth_user, "email", None)
+                    sb_user = None
+                    if auth_email:
+                        sb_user = SbUser.objects.filter(email=auth_email).first()
+                    if sb_user and cover_letter.user_id == sb_user.id:
+                        ApplicationCoverLetter.objects.get_or_create(
+                            application=app,
+                            cover_letter=cover_letter
+                        )
+                except CoverLetter.DoesNotExist:
+                    pass  # Silently ignore if cover letter not found
+                except Exception:
+                    pass  # Silently ignore errors attaching cover letter
         except Exception as e:
             return Response({"detail": f"failed to create application: {e}"}, status=400)
 
@@ -686,6 +729,253 @@ class RecommendationViewSet(viewsets.ReadOnlyModelViewSet):
     queryset = Recommendation.objects.all()
     serializer_class = RecommendationSerializer
     permission_classes = [permissions.IsAuthenticated]
+
+
+class CoverLetterViewSet(viewsets.ModelViewSet):
+    """ViewSet for cover letter generation and management"""
+    serializer_class = CoverLetterSerializer
+    permission_classes = [permissions.IsAuthenticated]
+    
+    def get_queryset(self):
+        """Return cover letters for the authenticated user"""
+        # Resolve SbUser from Django User
+        auth_user = getattr(self.request, "user", None)
+        auth_email = getattr(auth_user, "email", None)
+        sb_user = None
+        if auth_email:
+            sb_user = SbUser.objects.filter(email=auth_email).first()
+        if not sb_user:
+            return CoverLetter.objects.none()
+        return CoverLetter.objects.filter(user_id=sb_user.id)
+    
+    @action(detail=False, methods=["post"], url_path="generate")
+    def generate(self, request):
+        """Generate a cover letter using AI based on CV and job description"""
+        if not request.user.is_authenticated:
+            return Response({"detail": "Authentication required"}, status=401)
+        
+        cv_id = request.data.get("cv_id")
+        job_id = request.data.get("job_id")
+        job_description = request.data.get("job_description", "")
+        tone = request.data.get("tone", "professional")  # professional, casual, creative
+        
+        # Get CV
+        cv_text = ""
+        if cv_id:
+            try:
+                cv = CV.objects.get(id=cv_id)
+                cv_text = cv.parsed_text or ""
+            except CV.DoesNotExist:
+                return Response({"detail": "CV not found"}, status=404)
+        else:
+            # Get latest CV for user - need to resolve SbUser from Django User
+            try:
+                auth_user = getattr(request, "user", None)
+                auth_email = getattr(auth_user, "email", None)
+                sb_user = None
+                if auth_email:
+                    sb_user = SbUser.objects.filter(email=auth_email).first()
+                if not sb_user:
+                    return Response({
+                        "detail": "Associated Supabase user not found for authenticated account",
+                        "hint": "Ensure a matching SbUser exists with the same email as the logged-in user",
+                    }, status=404)
+                latest_cv = CV.objects.filter(user_id=sb_user.id).order_by("-created_at").first()
+                if not latest_cv:
+                    return Response({
+                        "detail": "No uploaded CV found for the authenticated user",
+                        "hint": "Upload a CV first using /api/rag/cv-upload/",
+                    }, status=404)
+                cv_text = latest_cv.parsed_text or ""
+            except Exception as e:
+                return Response({"detail": f"Error fetching CV: {str(e)}"}, status=400)
+        
+        if not cv_text:
+            return Response({"detail": "CV text is empty"}, status=400)
+        
+        # Get job description
+        job_title = ""
+        company_name = ""
+        if job_id:
+            try:
+                job = Job.objects.get(id=job_id)
+                job_description = job.description or job_description
+                job_title = job.title or ""
+                # Try to get company name
+                try:
+                    if job.company:
+                        company_name = getattr(job.company, "name", "") or ""
+                except Exception:
+                    pass
+            except Job.DoesNotExist:
+                return Response({"detail": "Job not found"}, status=404)
+        
+        if not job_description:
+            return Response({"detail": "Job description is required"}, status=400)
+        
+        # Call Fireworks for cover letter generation
+        if not FIREWORKS_API_KEY:
+            return Response({
+                "detail": "FIREWORKS_API_KEY is not set",
+                "hint": "Configure FIREWORKS_API_KEY in environment",
+            }, status=400)
+        
+        tone_instructions = {
+            "professional": "Write in a formal, professional tone suitable for corporate environments.",
+            "casual": "Write in a friendly, approachable tone while maintaining professionalism.",
+            "creative": "Write in an engaging, creative tone that showcases personality while remaining professional.",
+        }
+        
+        system_prompt = (
+            "You are an expert cover letter writer. Generate compelling, personalized cover letters "
+            "that effectively match the candidate's CV with the job requirements. "
+            f"{tone_instructions.get(tone, tone_instructions['professional'])} "
+            "The cover letter should be 300-400 words, well-structured, and highlight relevant skills and experiences."
+        )
+        
+        user_prompt = (
+            f"Candidate CV:\n{cv_text}\n\n"
+            f"Job Title: {job_title}\n"
+            f"Company: {company_name}\n"
+            f"Job Description:\n{job_description}\n\n"
+            "Generate a compelling cover letter that:\n"
+            "- Highlights relevant skills and experiences from the CV\n"
+            "- Addresses the job requirements directly\n"
+            "- Shows genuine enthusiasm for the role\n"
+            "- Demonstrates understanding of the company/position\n"
+            "- Is professional, concise, and well-structured (300-400 words)\n"
+            "- Includes a proper greeting and closing\n\n"
+            "Return ONLY the cover letter text, no additional commentary or formatting instructions."
+        )
+        
+        try:
+            url = f"{FIREWORKS_BASE_URL}/chat/completions"
+            model_name = config("FIREWORKS_CHAT_MODEL", default="accounts/fireworks/models/llama-v3p1-70b-instruct")
+            headers = {
+                "Authorization": f"Bearer {FIREWORKS_API_KEY}",
+                "Content-Type": "application/json",
+            }
+            payload = {
+                "model": model_name,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                "temperature": 0.7,
+            }
+            r = requests.post(url, headers=headers, json=payload, timeout=60)
+            if not r.ok:
+                return Response({"detail": f"Fireworks error: {r.status_code}", "body": r.text}, status=400)
+            data_resp = r.json()
+            cover_letter_text = data_resp.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+        except Exception as e:
+            return Response({"detail": f"Model call failed: {e}"}, status=400)
+        
+        if not cover_letter_text:
+            return Response({"detail": "Failed to generate cover letter"}, status=400)
+        
+        # Get CV for saving (if cv_id provided) - need to resolve SbUser
+        cv_obj = None
+        auth_user = getattr(request, "user", None)
+        auth_email = getattr(auth_user, "email", None)
+        sb_user = None
+        if auth_email:
+            sb_user = SbUser.objects.filter(email=auth_email).first()
+        
+        if cv_id:
+            try:
+                cv_obj = CV.objects.get(id=cv_id)
+            except CV.DoesNotExist:
+                pass
+        else:
+            if sb_user:
+                cv_obj = CV.objects.filter(user_id=sb_user.id).order_by("-created_at").first()
+        
+        # Get job for saving (if job_id provided)
+        job_obj = None
+        if job_id:
+            try:
+                job_obj = Job.objects.get(id=job_id)
+            except Job.DoesNotExist:
+                pass
+        
+        return Response({
+            "cover_letter": cover_letter_text,
+            "cv_id": str(cv_obj.id) if cv_obj else None,
+            "job_id": str(job_obj.id) if job_obj else None,
+            "job_title": job_title,
+            "company_name": company_name,
+        }, status=200)
+    
+    @action(detail=False, methods=["post"], url_path="save")
+    def save_version(self, request):
+        """Save a cover letter version"""
+        if not request.user.is_authenticated:
+            return Response({"detail": "Authentication required"}, status=401)
+        
+        cover_letter_text = request.data.get("cover_letter")
+        cv_id = request.data.get("cv_id")
+        job_id = request.data.get("job_id")
+        job_description = request.data.get("job_description", "")
+        version_name = request.data.get("version_name", "Version 1")
+        
+        if not cover_letter_text:
+            return Response({"detail": "Cover letter text is required"}, status=400)
+        
+        # Get CV - need to resolve SbUser from Django User
+        cv_obj = None
+        auth_user = getattr(request, "user", None)
+        auth_email = getattr(auth_user, "email", None)
+        sb_user = None
+        if auth_email:
+            sb_user = SbUser.objects.filter(email=auth_email).first()
+        if not sb_user:
+            return Response({
+                "detail": "Associated Supabase user not found for authenticated account",
+                "hint": "Ensure a matching SbUser exists with the same email as the logged-in user",
+            }, status=404)
+        
+        if cv_id:
+            try:
+                cv_obj = CV.objects.get(id=cv_id, user_id=sb_user.id)
+            except CV.DoesNotExist:
+                return Response({"detail": "CV not found"}, status=404)
+        else:
+            cv_obj = CV.objects.filter(user_id=sb_user.id).order_by("-created_at").first()
+            if not cv_obj:
+                return Response({"detail": "No CV found"}, status=404)
+        
+        # Get job (optional)
+        job_obj = None
+        if job_id:
+            try:
+                job_obj = Job.objects.get(id=job_id)
+            except Job.DoesNotExist:
+                pass
+        
+        # Count existing versions for this CV+Job combination to suggest next version name
+        existing_count = CoverLetter.objects.filter(
+            user_id=sb_user.id,
+            cv=cv_obj,
+            job=job_obj if job_obj else None
+        ).count()
+        
+        if existing_count > 0 and version_name == "Version 1":
+            version_name = f"Version {existing_count + 1}"
+        
+        try:
+            cover_letter = CoverLetter.objects.create(
+                user_id=sb_user.id,
+                cv=cv_obj,
+                job=job_obj,
+                job_description=job_description if not job_obj else None,
+                cover_letter_text=cover_letter_text,
+                version_name=version_name,
+            )
+            serializer = CoverLetterSerializer(cover_letter)
+            return Response(serializer.data, status=201)
+        except Exception as e:
+            return Response({"detail": str(e)}, status=500)
 
 
 class RAGSearchView(APIView):
@@ -1427,7 +1717,10 @@ class VoiceChatTurnView(APIView):
         if audio_file and not user_text:
             openai_api_key = config("OPENAI_API_KEY", default=None)
             if not openai_api_key:
-                return Response({"detail": "OPENAI_API_KEY not configured for STT"}, status=400)
+                return Response({
+                    "detail": "OPENAI_API_KEY not configured for STT",
+                    "hint": "Set OPENAI_API_KEY environment variable. Voice chat requires OpenAI API key for Whisper speech-to-text."
+                }, status=400)
             try:
                 audio_file.seek(0)
                 whisper_url = "https://api.openai.com/v1/audio/transcriptions"
@@ -1438,7 +1731,20 @@ class VoiceChatTurnView(APIView):
                 if wr.ok:
                     user_text = wr.json().get("text", "")
                 else:
-                    return Response({"detail": f"Whisper error: {wr.status_code}", "body": wr.text}, status=400)
+                    # Parse OpenAI error response for better error message
+                    error_detail = f"Whisper error: {wr.status_code}"
+                    try:
+                        error_body = wr.json()
+                        if isinstance(error_body, dict):
+                            error_msg = error_body.get("error", {})
+                            if isinstance(error_msg, dict):
+                                error_detail = error_msg.get("message", error_detail)
+                                error_code = error_msg.get("code", "")
+                                if error_code == "invalid_api_key":
+                                    error_detail = f"Invalid OpenAI API key: {error_detail}. Please check your OPENAI_API_KEY environment variable."
+                    except Exception:
+                        error_detail = f"Whisper error: {wr.status_code} - {wr.text[:200]}"
+                    return Response({"detail": error_detail}, status=400)
             except Exception as e:
                 return Response({"detail": f"STT failed: {e}"}, status=400)
 
@@ -1677,7 +1983,10 @@ class TechVoiceChatTurnView(APIView):
         if audio_file and not user_text:
             openai_api_key = config("OPENAI_API_KEY", default=None)
             if not openai_api_key:
-                return Response({"detail": "OPENAI_API_KEY is not configured"}, status=400)
+                return Response({
+                    "detail": "OPENAI_API_KEY is not configured",
+                    "hint": "Set OPENAI_API_KEY environment variable. Voice chat requires OpenAI API key for Whisper speech-to-text."
+                }, status=400)
             try:
                 audio_file.seek(0)
                 whisper_url = "https://api.openai.com/v1/audio/transcriptions"
@@ -1688,7 +1997,20 @@ class TechVoiceChatTurnView(APIView):
                 if wr.ok:
                     user_text = wr.json().get("text", "")
                 else:
-                    return Response({"detail": f"Whisper error: {wr.status_code}", "body": wr.text}, status=400)
+                    # Parse OpenAI error response for better error message
+                    error_detail = f"Whisper error: {wr.status_code}"
+                    try:
+                        error_body = wr.json()
+                        if isinstance(error_body, dict):
+                            error_msg = error_body.get("error", {})
+                            if isinstance(error_msg, dict):
+                                error_detail = error_msg.get("message", error_detail)
+                                error_code = error_msg.get("code", "")
+                                if error_code == "invalid_api_key":
+                                    error_detail = f"Invalid OpenAI API key: {error_detail}. Please check your OPENAI_API_KEY environment variable."
+                    except Exception:
+                        error_detail = f"Whisper error: {wr.status_code} - {wr.text[:200]}"
+                    return Response({"detail": error_detail}, status=400)
             except Exception as e:
                 return Response({"detail": f"STT failed: {e}"}, status=400)
 

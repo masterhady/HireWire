@@ -41,6 +41,12 @@ from .supabase_views import (
     TechVoiceChatTurnView,
     TechVoiceChatEvaluateView,
 )
+from .resume_views import (
+    ResumeViewSet, WorkExperienceViewSet, EducationViewSet, 
+    ResumeSkillViewSet, ResumeProjectViewSet
+)
+from .video_interview_views import VideoInterviewViewSet
+from .analytics_views import AnalyticsViewSet
 
 router = DefaultRouter()
 router.register(r"companies", CompanyViewSet, basename="companies")
@@ -53,6 +59,13 @@ router.register(r"job-embeddings", JobEmbeddingViewSet, basename="job-embeddings
 router.register(r"applications", ApplicationViewSet, basename="applications")
 router.register(r"recommendations", RecommendationViewSet, basename="recommendations")
 router.register(r"cover-letters", CoverLetterViewSet, basename="cover-letters")
+router.register(r"resumes", ResumeViewSet, basename="resumes")
+router.register(r"resume-experience", WorkExperienceViewSet, basename="resume-experience")
+router.register(r"resume-education", EducationViewSet, basename="resume-education")
+router.register(r"resume-skills", ResumeSkillViewSet, basename="resume-skills")
+router.register(r"resume-projects", ResumeProjectViewSet, basename="resume-projects")
+router.register(r"video-interviews", VideoInterviewViewSet, basename="video-interviews")
+router.register(r'analytics', AnalyticsViewSet, basename='analytics')
 
 urlpatterns = [
     path("auth/register/", RegisterView.as_view(), name="auth_register"),

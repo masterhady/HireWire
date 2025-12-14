@@ -3,6 +3,8 @@ from typing import List, Tuple
 from decouple import config
 from django.db import connection
 
+
+
 try:
     from openai import OpenAI
 except Exception:
@@ -156,7 +158,7 @@ def embed_text(text: str) -> List[float]:
     return embed_text_openai(text)
 
 
-def search_similar_jobs(embedding: List[float], top_n: int = 10, similarity_threshold: float = 0.5) -> List[Tuple]:
+def search_similar_jobs(embedding: List[float], top_n: int = 10, similarity_threshold: float = 0.6) -> List[Tuple]:
     """
     Search for similar jobs using cosine similarity with pgvector.
     """

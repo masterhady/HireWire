@@ -8,6 +8,7 @@ import uuid
 from django.core.files.base import ContentFile
 from django.core.files.storage import default_storage
 from django.http import HttpResponse
+from typing import Optional
 
 from .supabase_models import (
     SbCompany,
@@ -850,7 +851,7 @@ class CoverLetterViewSet(viewsets.ModelViewSet):
         
         try:
             url = f"{FIREWORKS_BASE_URL}/chat/completions"
-            model_name = config("FIREWORKS_CHAT_MODEL", default="accounts/fireworks/models/llama-v3p1-70b-instruct")
+            model_name = config("FIREWORKS_CHAT_MODEL", default="accounts/fireworks/models/llama-v3p3-70b-instruct")
             headers = {
                 "Authorization": f"Bearer {FIREWORKS_API_KEY}",
                 "Content-Type": "application/json",
@@ -1124,7 +1125,7 @@ class CVMatchView(APIView):
         cv_id = request.data.get("cv_id")
         cv_text = request.data.get("cv_text")
         top_n = int(request.data.get("top_n", 5))
-        similarity_threshold = float(request.data.get("similarity_threshold", 0.5))
+        similarity_threshold = float(request.data.get("similarity_threshold", 0.6))
         must_contain = request.data.get("must_contain") or []
         must_not_contain = request.data.get("must_not_contain") or []
 
@@ -1609,7 +1610,7 @@ class CVRecommendationsView(APIView):
 
         try:
             url = f"{FIREWORKS_BASE_URL}/chat/completions"
-            model_name = config("FIREWORKS_CHAT_MODEL", default="accounts/fireworks/models/llama-v3p1-70b-instruct")
+            model_name = config("FIREWORKS_CHAT_MODEL", default="accounts/fireworks/models/llama-v3p3-70b-instruct")
             headers = {
                 "Authorization": f"Bearer {FIREWORKS_API_KEY}",
                 "Content-Type": "application/json",
@@ -1679,6 +1680,165 @@ class CVRecommendationsView(APIView):
             "analyzed_chars": len(text),
         }
         return Response(result, status=200)
+
+
+class CVRewriteView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def _resolve_cv_text(self, request, cv_id: Optional[str], cv_text: Optional[str]):
+        """Resolve CV text from provided cv_id/cv_text or latest CV.
+
+        Returns tuple: (cv_text or None, error_response or None)
+        """
+        if cv_id and not cv_text:
+            try:
+                cv_obj = CV.objects.get(id=cv_id)
+                cv_text = cv_obj.parsed_text or ""
+            except CV.DoesNotExist:
+                return None, Response({"detail": "cv_id not found"}, status=404)
+
+        if not cv_id and not cv_text:
+            auth_user = getattr(request, "user", None)
+            auth_email = getattr(auth_user, "email", None)
+            sb_user = None
+            if auth_email:
+                sb_user = SbUser.objects.filter(email=auth_email).first()
+            if not sb_user:
+                return None, Response({
+                    "detail": "Associated Supabase user not found for authenticated account",
+                    "hint": "Ensure a matching SbUser exists with the same email as the logged-in user",
+                }, status=404)
+            latest_cv = CV.objects.filter(user_id=sb_user.id).order_by('-created_at').first()
+            if not latest_cv:
+                return None, Response({
+                    "detail": "No uploaded CV found for the authenticated user",
+                    "hint": "Upload a CV first using /api/rag/cv-upload/",
+                }, status=404)
+            cv_text = latest_cv.parsed_text or ""
+
+        if not cv_text:
+            return None, Response({"detail": "cv_text is empty"}, status=400)
+
+        return cv_text, None
+
+    def post(self, request):
+        """
+        Rewrite/improve a CV using AI, applying the provided suggestions/improvement plan.
+
+        Body:
+          - cv_id (optional)
+          - cv_text (optional)
+          - job_description (optional)
+          - tone (optional, default 'professional')
+          - suggestions (optional array of suggestion dicts/strings)
+        """
+        cv_id = request.data.get("cv_id")
+        cv_text = request.data.get("cv_text")
+        job_description = (request.data.get("job_description") or "").strip()
+        tone = request.data.get("tone", "professional")
+        suggestions = request.data.get("suggestions") or []
+
+        if not FIREWORKS_API_KEY:
+            return Response({
+                "detail": "FIREWORKS_API_KEY is not set",
+                "hint": "Configure FIREWORKS_API_KEY in environment to enable CV generation",
+            }, status=400)
+
+        # Resolve CV text (may raise Response)
+        cv_text, error_response = self._resolve_cv_text(request, cv_id, cv_text)
+        if error_response:
+            return error_response
+        text = (cv_text or "").strip()
+
+        def _format_suggestions(items):
+            lines = []
+            if isinstance(items, list):
+                for entry in items:
+                    if isinstance(entry, dict):
+                        title = entry.get("title") or "Suggestion"
+                        details = entry.get("details") or entry.get("description") or ""
+                        priority = entry.get("priority")
+                        priority_text = f" (priority: {priority})" if priority else ""
+                        lines.append(f"- {title}{priority_text}: {details}")
+                    else:
+                        lines.append(f"- {str(entry)}")
+            return "\n".join(lines).strip()
+
+        guidance_block = _format_suggestions(suggestions)
+        if not guidance_block:
+            guidance_block = (
+                "- Clarify summary with quantifiable achievements\n"
+                "- Ensure bullet points start with action verbs and include metrics\n"
+                "- Keep format ATS-friendly with consistent headings"
+            )
+
+        target_role = job_description or "General professional resume suitable for the candidate's profile."
+
+        system_prompt = (
+            "You are an elite ATS-optimized resume writer. "
+            "Rewrite the candidate's CV by applying the improvement guidance, keeping a professional tone, "
+            "clear section headings (SUMMARY, EXPERIENCE, SKILLS, EDUCATION, CERTIFICATIONS if available), "
+            "and metric-driven bullet points. "
+            "Return STRICT JSON with keys: rewritten_cv (string), summary (string), key_changes (array of strings). "
+            "Ensure the rewritten CV remains truthful to the provided information."
+        )
+
+        user_prompt = (
+            f"Original CV:\n{text}\n\n"
+            f"Improvement Guidance:\n{guidance_block}\n\n"
+            f"Target Role / Job Description:\n{target_role}\n\n"
+            f"Desired Tone: {tone}\n\n"
+            "Return the JSON object now."
+        )
+
+        try:
+            url = f"{FIREWORKS_BASE_URL}/chat/completions"
+            model_name = config("FIREWORKS_CHAT_MODEL", default="accounts/fireworks/models/llama-v3p3-70b-instruct")
+            headers = {
+                "Authorization": f"Bearer {FIREWORKS_API_KEY}",
+                "Content-Type": "application/json",
+            }
+            payload = {
+                "model": model_name,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                "temperature": 0.2,
+                "response_format": {"type": "json_object"},
+            }
+            r = requests.post(url, headers=headers, json=payload, timeout=90)
+            if not r.ok:
+                return Response({"detail": f"Fireworks error: {r.status_code}", "body": r.text}, status=400)
+            data_resp = r.json()
+            content = data_resp.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+        except Exception as e:
+            return Response({"detail": f"Model call failed: {e}"}, status=400)
+
+        try:
+            data = json.loads(content)
+        except Exception:
+            m = re.search(r"\{[\s\S]*\}", content)
+            if not m:
+                return Response({"detail": "Model returned non-JSON output", "raw": content}, status=400)
+            try:
+                data = json.loads(m.group(0))
+            except Exception:
+                return Response({"detail": "Unable to parse model output", "raw": content}, status=400)
+
+        rewritten_cv = (data.get("rewritten_cv") or "").strip()
+        summary = data.get("summary") or ""
+        key_changes = data.get("key_changes") or []
+
+        if not rewritten_cv:
+            return Response({"detail": "Model did not return rewritten_cv"}, status=400)
+
+        return Response({
+            "rewritten_cv": rewritten_cv,
+            "summary": summary,
+            "key_changes": key_changes,
+            "tone": tone,
+        }, status=200)
 
 
 # ==================== VOICE CHAT (CONVERSATIONAL HR) ====================
@@ -1778,7 +1938,7 @@ class VoiceChatTurnView(APIView):
 
         try:
             url = f"{FIREWORKS_BASE_URL}/chat/completions"
-            model_name = config("FIREWORKS_CHAT_MODEL", default="accounts/fireworks/models/llama-v3p1-70b-instruct")
+            model_name = config("FIREWORKS_CHAT_MODEL", default="accounts/fireworks/models/llama-v3p3-70b-instruct")
             headers = {"Authorization": f"Bearer {FIREWORKS_API_KEY}", "Content-Type": "application/json"}
             payload = {"model": model_name, "messages": messages, "temperature": 0.6}
             r = requests.post(url, headers=headers, json=payload, timeout=60)
@@ -1900,7 +2060,7 @@ class VoiceChatEvaluateView(APIView):
             )
 
             url = f"{FIREWORKS_BASE_URL}/chat/completions"
-            model_name = config("FIREWORKS_CHAT_MODEL", default="accounts/fireworks/models/llama-v3p1-70b-instruct")
+            model_name = config("FIREWORKS_CHAT_MODEL", default="accounts/fireworks/models/llama-v3p3-70b-instruct")
             headers = {"Authorization": f"Bearer {FIREWORKS_API_KEY}", "Content-Type": "application/json"}
             payload = {
                 "model": model_name,
@@ -2058,7 +2218,7 @@ class TechVoiceChatTurnView(APIView):
 
             try:
                 url = f"{FIREWORKS_BASE_URL}/chat/completions"
-                model_name = config("FIREWORKS_CHAT_MODEL", default="accounts/fireworks/models/llama-v3p1-70b-instruct")
+                model_name = config("FIREWORKS_CHAT_MODEL", default="accounts/fireworks/models/llama-v3p3-70b-instruct")
                 headers = {"Authorization": f"Bearer {FIREWORKS_API_KEY}", "Content-Type": "application/json"}
                 payload = {"model": model_name, "messages": messages, "temperature": 0.5}
                 r = requests.post(url, headers=headers, json=payload, timeout=60)
@@ -2141,6 +2301,7 @@ class TechVoiceChatEvaluateView(APIView):
             pass
 
         transcript_lines = []
+        candidate_responses = []
         for m in history[-50:]:
             role = m.get("role")
             content = (m.get("content") or "").strip()
@@ -2148,7 +2309,19 @@ class TechVoiceChatEvaluateView(APIView):
                 continue
             who = "Candidate" if role == "user" else "Interviewer"
             transcript_lines.append(f"{who}: {content}")
+            if role == "user":  # Count candidate responses
+                candidate_responses.append(content)
         transcript = "\n".join(transcript_lines)
+
+        # If no candidate responses or transcript is empty/too short, return 0 score
+        if not candidate_responses or len(candidate_responses) == 0 or not transcript.strip() or len(transcript.strip()) < 10:
+            return Response({
+                "overall_score": 0,
+                "strengths": [],
+                "weaknesses": ["No answers provided for evaluation"],
+                "improvement_tips": ["Please provide answers to the interview questions"],
+                "summary": "Cannot evaluate: No candidate responses found in the interview transcript."
+            }, status=200)
 
         if not FIREWORKS_API_KEY:
             score = max(50, min(90, 65 + len(transcript) // 700))
@@ -2172,7 +2345,7 @@ class TechVoiceChatEvaluateView(APIView):
         user_prompt += f"Interview Transcript:\n{transcript}\n\nProvide the JSON now."
         try:
             url = f"{FIREWORKS_BASE_URL}/chat/completions"
-            model_name = config("FIREWORKS_CHAT_MODEL", default="accounts/fireworks/models/llama-v3p1-70b-instruct")
+            model_name = config("FIREWORKS_CHAT_MODEL", default="accounts/fireworks/models/llama-v3p3-70b-instruct")
             headers = {"Authorization": f"Bearer {FIREWORKS_API_KEY}", "Content-Type": "application/json"}
             payload = {"model": model_name, "messages": [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}], "temperature": 0.4, "response_format": {"type": "json_object"}}
             r = requests.post(url, headers=headers, json=payload, timeout=60)
@@ -2187,8 +2360,11 @@ class TechVoiceChatEvaluateView(APIView):
                     m = re.search(r"\{[\s\S]*\}", s)
                     return json.loads(m.group(0)) if m else None
             data = _parse_json(content) or {}
+            # Calculate score from AI response
+            calculated_score = max(0, min(100, int(float(data.get("overall_score", 0))))) if str(data.get("overall_score", "")).strip() != "" else 0
+            
             result = {
-                "overall_score": max(0, min(100, int(float(data.get("overall_score", 0))))) if str(data.get("overall_score", "")).strip() != "" else 0,
+                "overall_score": calculated_score,
                 "strengths": data.get("strengths") or [],
                 "weaknesses": data.get("weaknesses") or [],
                 "improvement_tips": data.get("improvement_tips") or [],
@@ -2281,7 +2457,7 @@ class DashboardView(APIView):
                 else:
                     try:
                         url = f"{FIREWORKS_BASE_URL}/chat/completions"
-                        model_name = config("FIREWORKS_CHAT_MODEL", default="accounts/fireworks/models/llama-v3p1-70b-instruct")
+                        model_name = config("FIREWORKS_CHAT_MODEL", default="accounts/fireworks/models/llama-v3p3-70b-instruct")
                         headers = {
                             "Authorization": f"Bearer {FIREWORKS_API_KEY}",
                             "Content-Type": "application/json",
@@ -2394,7 +2570,7 @@ class CareerAdvisorView(APIView):
 
         try:
             url = f"{FIREWORKS_BASE_URL}/chat/completions"
-            model_name = config("FIREWORKS_CHAT_MODEL", default="accounts/fireworks/models/llama-v3p1-70b-instruct")
+            model_name = config("FIREWORKS_CHAT_MODEL", default="accounts/fireworks/models/llama-v3p3-70b-instruct")
             headers = {
                 "Authorization": f"Bearer {FIREWORKS_API_KEY}",
                 "Content-Type": "application/json",
@@ -2535,7 +2711,7 @@ class InterviewQuestionsView(APIView):
 
         try:
             url = f"{FIREWORKS_BASE_URL}/chat/completions"
-            model_name = config("FIREWORKS_CHAT_MODEL", default="accounts/fireworks/models/llama-v3p1-70b-instruct")
+            model_name = config("FIREWORKS_CHAT_MODEL", default="accounts/fireworks/models/llama-v3p3-70b-instruct")
             headers = {
                 "Authorization": f"Bearer {FIREWORKS_API_KEY}",
                 "Content-Type": "application/json",
@@ -2698,7 +2874,7 @@ class InterviewPracticeView(APIView):
 
         try:
             url = f"{FIREWORKS_BASE_URL}/chat/completions"
-            model_name = config("FIREWORKS_CHAT_MODEL", default="accounts/fireworks/models/llama-v3p1-70b-instruct")
+            model_name = config("FIREWORKS_CHAT_MODEL", default="accounts/fireworks/models/llama-v3p3-70b-instruct")
             headers = {
                 "Authorization": f"Bearer {FIREWORKS_API_KEY}",
                 "Content-Type": "application/json",
@@ -2838,7 +3014,7 @@ class InterviewAnswerEvaluationView(APIView):
 
         try:
             url = f"{FIREWORKS_BASE_URL}/chat/completions"
-            model_name = config("FIREWORKS_CHAT_MODEL", default="accounts/fireworks/models/llama-v3p1-70b-instruct")
+            model_name = config("FIREWORKS_CHAT_MODEL", default="accounts/fireworks/models/llama-v3p3-70b-instruct")
             headers = {
                 "Authorization": f"Bearer {FIREWORKS_API_KEY}",
                 "Content-Type": "application/json",
@@ -3092,7 +3268,7 @@ class InterviewBatchSubmissionView(APIView):
 
         try:
             url = f"{FIREWORKS_BASE_URL}/chat/completions"
-            model_name = config("FIREWORKS_CHAT_MODEL", default="accounts/fireworks/models/llama-v3p1-70b-instruct")
+            model_name = config("FIREWORKS_CHAT_MODEL", default="accounts/fireworks/models/llama-v3p3-70b-instruct")
             headers = {
                 "Authorization": f"Bearer {FIREWORKS_API_KEY}",
                 "Content-Type": "application/json",
@@ -3426,7 +3602,7 @@ class AudioInterviewQuestionsView(APIView):
 
         try:
             url = f"{FIREWORKS_BASE_URL}/chat/completions"
-            model_name = config("FIREWORKS_CHAT_MODEL", default="accounts/fireworks/models/llama-v3p1-70b-instruct")
+            model_name = config("FIREWORKS_CHAT_MODEL", default="accounts/fireworks/models/llama-v3p3-70b-instruct")
             headers = {
                 "Authorization": f"Bearer {FIREWORKS_API_KEY}",
                 "Content-Type": "application/json",
@@ -3854,7 +4030,7 @@ class AudioInterviewBatchSubmissionView(APIView):
 
         try:
             url = f"{FIREWORKS_BASE_URL}/chat/completions"
-            model_name = config("FIREWORKS_CHAT_MODEL", default="accounts/fireworks/models/llama-v3p1-70b-instruct")
+            model_name = config("FIREWORKS_CHAT_MODEL", default="accounts/fireworks/models/llama-v3p3-70b-instruct")
             headers = {
                 "Authorization": f"Bearer {FIREWORKS_API_KEY}",
                 "Content-Type": "application/json",

@@ -44,7 +44,7 @@ Instead of using OpenAI for TTS/STT, we now use:
 # REMOVED: OPENAI_API_KEY=sk-...
 
 # Keep only Fireworks settings:
-FIREWORKS_API_KEY=fw_3ZPaFUzNMHy7FLpefcG5QJmS
+FIREWORKS_API_KEY=fw_3ZNMRUgDnpJnz1cH6t2Co9L1
 EMBEDDING_PROVIDER=fireworks
 ```
 

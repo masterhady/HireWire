@@ -39,21 +39,20 @@ class ResumeSerializer(serializers.ModelSerializer):
         projects_data = validated_data.pop('projects', [])
 
         resume = Resume.objects.create(**validated_data)
-
-        # Filter out empty items before creating
+        # Create nested items, filtering out empty/invalid entries to avoid creating
+        # records with missing required fields (safer for frontend-submitted data).
         for item in work_experience_data:
-            if item.get('job_title') and item.get('company'):
+            if item and item.get('job_title') and item.get('company'):
                 WorkExperience.objects.create(resume=resume, **item)
         for item in education_data:
-            if item.get('degree') and item.get('institution'):
+            if item and item.get('degree') and item.get('institution'):
                 Education.objects.create(resume=resume, **item)
         for item in skills_data:
-            if item.get('name'):
+            if item and item.get('name'):
                 ResumeSkill.objects.create(resume=resume, **item)
         for item in projects_data:
-            if item.get('name'):
+            if item and item.get('name'):
                 ResumeProject.objects.create(resume=resume, **item)
-
         return resume
 
     def update(self, instance, validated_data):
@@ -72,20 +71,20 @@ class ResumeSerializer(serializers.ModelSerializer):
         instance.portfolio_url = validated_data.get('portfolio_url', instance.portfolio_url)
         instance.save()
 
-        # Helper to update nested relations
-        def update_nested(model, serializer_cls, current_items, new_data, required_fields):
-            # Delete missing items
-            # This is a simple full replacement strategy for simplicity in this MVP
-            # A more robust approach would match by ID to update existing ones
-            current_items.all().delete()
-            for item in new_data:
-                # Only create if all required fields are present and non-empty
-                if all(item.get(field) for field in required_fields):
-                    model.objects.create(resume=instance, **item)
+    # Helper to update nested relations using a full-replace strategy.
+    # We accept `required_fields` so callers can supply validation rules.
+    def update_nested(model, serializer_cls, current_items, new_data, required_fields=None):
+        current_items.all().delete()
+        for item in new_data:
+        if not item:
+            continue
+        if required_fields:
+            if not all(item.get(f) for f in required_fields):
+            continue
+        model.objects.create(resume=instance, **item)
 
-        update_nested(WorkExperience, WorkExperienceSerializer, instance.work_experience, work_experience_data, ['job_title', 'company'])
-        update_nested(Education, EducationSerializer, instance.education, education_data, ['degree', 'institution'])
-        update_nested(ResumeSkill, ResumeSkillSerializer, instance.skills, skills_data, ['name'])
-        update_nested(ResumeProject, ResumeProjectSerializer, instance.projects, projects_data, ['name'])
-
+    update_nested(WorkExperience, WorkExperienceSerializer, instance.work_experience, work_experience_data, required_fields=['job_title', 'company'])
+    update_nested(Education, EducationSerializer, instance.education, education_data, required_fields=['degree', 'institution'])
+    update_nested(ResumeSkill, ResumeSkillSerializer, instance.skills, skills_data, required_fields=['name'])
+    update_nested(ResumeProject, ResumeProjectSerializer, instance.projects, projects_data, required_fields=['name'])
         return instance

@@ -1,240 +1,17 @@
+"""Compatibility wrapper for WebSocket interview consumers.
+
+This module provides RealtimeInterviewConsumer as a compatible alias that
+points to the more feature-complete OpenAI realtime consumer implementation
+found in `api.openai_realtime_consumer`. Keeping this small wrapper lets
+other modules continue importing `RealtimeInterviewConsumer` from
+`api.consumers` while we centralize the realtime logic in a single file.
 """
-WebSocket consumer for Groq-based modular AI interview.
 
-Uses Groq Whisper for STT and Groq Llama 3 for LLM.
-The browser handles TTS using the Web Speech API.
-"""
+from api.openai_realtime_consumer import OpenAIRealtimeInterviewConsumer
 
-import json
-import asyncio
-import base64
-import httpx
-from channels.generic.websocket import AsyncWebsocketConsumer
-from decouple import config
-import logging
-import io
-import wave
+# Expose a backward-compatible name used across the codebase
+RealtimeInterviewConsumer = OpenAIRealtimeInterviewConsumer
 
-logger = logging.getLogger(__name__)
-
-
-class RealtimeInterviewConsumer(AsyncWebsocketConsumer):
-    """
-    WebSocket consumer that bridges browser ↔ Django ↔ Groq.
-    """
-    
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.session_id = None
-        self.job_description = None
-        self.conversation_history = []
-        self.is_processing = False
-        
-    async def connect(self):
-        """Handle WebSocket connection from browser."""
-        await self.accept()
-        
-        self.groq_api_key = config("GROQ_API_KEY", default=None)
-        if not self.groq_api_key:
-            logger.error("❌ GROQ_API_KEY not found in environment")
-            await self.send(text_data=json.dumps({
-                "type": "error",
-                "message": "GROQ_API_KEY not configured on server"
-            }))
-            await self.close()
-            return
-        
-        logger.info(f"✅ WebSocket connected from {self.scope.get('client', 'unknown')}")
-        logger.info(f"🔑 GROQ_API_KEY found: {self.groq_api_key[:10]}...")
-        
-        await self.send(text_data=json.dumps({
-            "type": "connected",
-            "message": "Connected to Groq-powered interview server."
-        }))
-    
-    async def disconnect(self, close_code):
-        """Handle WebSocket disconnection."""
-        logger.info(f"WebSocket disconnected with code: {close_code}")
-    
-    async def receive(self, text_data=None, bytes_data=None):
-        """Handle messages from browser."""
-        try:
-            if text_data:
-                data = json.loads(text_data)
-                message_type = data.get("type")
-                logger.info(f"📨 Received message type: {message_type}")
-                
-                if message_type == "start_session":
-                    logger.info("🎬 Starting session...")
-                    await self.start_session(data)
-                    
-                elif message_type == "audio":
-                    logger.info("🎤 Received audio data")
-                    # In modular mode, we expect a full audio blob (base64)
-                    await self.handle_audio_turn(data.get("audio"))
-                    
-                elif message_type == "stop_session":
-                    logger.info("🛑 Stopping session...")
-                    
-                    # Generate feedback before ending session
-                    if len(self.conversation_history) > 1:  # More than just system prompt
-                        await self.generate_interview_feedback()
-                    
-                    await self.send(text_data=json.dumps({
-                        "type": "session_ended",
-                        "message": "Interview session ended"
-                    }))
-                    
-        except Exception as e:
-            logger.error(f"❌ Error in receive: {e}")
-            await self.send(text_data=json.dumps({
-                "type": "error",
-                "message": str(e)
-            }))
-    
-    async def start_session(self, data):
-        """Initialize the interview session."""
-        self.job_description = data.get("job_description", "")
-        self.session_id = data.get("session_id")
-        logger.info(f"📋 Session ID: {self.session_id}")
-        logger.info(f"💼 Job Description: {self.job_description[:50] if self.job_description else 'None'}...")
-        
-        # Initialize conversation history with system prompt
-        self.conversation_history = [
-            {"role": "system", "content": self._get_system_instructions()}
-        ]
-        logger.info(f"📝 Initialized conversation history with system prompt")
-        
-        # Trigger initial greeting
-        logger.info("🤖 Generating initial AI greeting...")
-        await self.generate_ai_response("The user has just joined. Please introduce yourself briefly and ask if they are ready.")
-        
-        await self.send(text_data=json.dumps({
-            "type": "session_started",
-            "message": "Groq AI interviewer is ready."
-        }))
-        logger.info("✅ Session started successfully")
-    
-    def _get_system_instructions(self) -> str:
-        """Get system instructions for the AI interviewer."""
-        instructions = (
-            "You are a professional HR interviewer conducting a voice interview. "
-            "Keep your responses conversational, clear, and concise (max 2-3 sentences). "
-            "Ask follow-up questions based on the candidate's responses. "
-            "Be friendly but professional. "
-            "Focus on behavioral questions, cultural fit, and career goals. "
-        )
-        
-        if self.job_description:
-            instructions += f"\n\nTarget job description: {self.job_description}\n"
-            instructions += "Tailor your questions to assess fit for this specific role."
-        
-        return instructions
-
-    async def handle_audio_turn(self, audio_base64: str):
-        """Process a full audio turn using Groq STT and LLM."""
-        if self.is_processing:
-            logger.warning("⚠️ Already processing, skipping this audio")
-            return
-        
-        self.is_processing = True
-        logger.info("🔄 Processing audio turn...")
-        try:
-            # 1. STT: Convert audio to text
-            logger.info(f"🎧 Audio size: {len(audio_base64)} chars")
-            transcript = await self.speech_to_text(audio_base64)
-            if not transcript:
-                logger.warning("⚠️ No transcript received from STT")
-                self.is_processing = False
-                return
-            
-            logger.info(f"📝 User said: {transcript}")
-            
-            # Send user transcript to browser for UI
-            await self.send(text_data=json.dumps({
-                "type": "user_transcript",
-                "text": transcript
-            }))
-            
-            # 2. LLM: Generate AI response
-            logger.info("🤖 Generating AI response...")
-            await self.generate_ai_response(transcript)
-            
-        except Exception as e:
-            logger.error(f"❌ Error handling audio turn: {e}", exc_info=True)
-            await self.send(text_data=json.dumps({
-                "type": "error",
-                "message": f"Processing error: {str(e)}"
-            }))
-        finally:
-            self.is_processing = False
-            logger.info("✅ Audio turn processing complete")
-
-    async def speech_to_text(self, audio_base64: str) -> str:
-        """Call Groq Whisper API for STT."""
-        try:
-            logger.info("🎯 Decoding audio...")
-            audio_data = base64.b64decode(audio_base64)
-            logger.info(f"📊 Audio data size: {len(audio_data)} bytes")
-            
-            # Groq Whisper expects a file-like object
-            files = {
-                "file": ("audio.wav", audio_data, "audio/wav"),
-                "model": (None, "whisper-large-v3"),
-                "response_format": (None, "json"),
-            }
-            
-            headers = {"Authorization": f"Bearer {self.groq_api_key}"}
-            
-            logger.info("🌐 Calling Groq Whisper API...")
-            async with httpx.AsyncClient() as client:
-                response = await client.post(
-                    "https://api.groq.com/openai/v1/audio/transcriptions",
-                    headers=headers,
-                    files=files,
-                    timeout=30.0
-                )
-                
-                logger.info(f"📡 Groq STT Response Status: {response.status_code}")
-                if response.status_code != 200:
-                    logger.error(f"❌ Groq STT Error: {response.text}")
-                    return ""
-                
-                result = response.json().get("text", "")
-                logger.info(f"✅ STT Result: {result}")
-                return result
-                
-        except Exception as e:
-            logger.error(f"❌ STT Exception: {e}", exc_info=True)
-            return ""
-
-    async def generate_ai_response(self, user_text: str):
-        """Call Groq LLM API for response."""
-        try:
-            logger.info(f"💬 Adding user message to history: {user_text[:50]}...")
-            self.conversation_history.append({"role": "user", "content": user_text})
-            
-            headers = {
-                "Authorization": f"Bearer {self.groq_api_key}",
-                "Content-Type": "application/json"
-            }
-            
-            payload = {
-                "model": "llama-3.3-70b-versatile",
-                "messages": self.conversation_history,
-                "temperature": 0.7,
-                "max_tokens": 150
-            }
-            
-            logger.info(f"🌐 Calling Groq LLM API (model: llama-3.3-70b-versatile)...")
-            async with httpx.AsyncClient() as client:
-                response = await client.post(
-                    "https://api.groq.com/openai/v1/chat/completions",
-                    headers=headers,
-                    json=payload,
-                    timeout=30.0
-                )
-                
                 logger.info(f"📡 Groq LLM Response Status: {response.status_code}")
                 if response.status_code != 200:
                     logger.error(f"❌ Groq LLM Error: {response.text}")
@@ -401,3 +178,125 @@ class RealtimeInterviewConsumer(AsyncWebsocketConsumer):
                 "improvements": ["Continue developing your skills"],
                 "recommendations": ["Practice more interviews"]
             }
+=======
+            base_instructions += f"\n\nTarget job description: {self.job_description}\n"
+            base_instructions += "Tailor your questions to assess fit for this specific role."
+        
+        return base_instructions
+    
+    async def listen_to_openai(self):
+        """Listen for messages from OpenAI Realtime API and forward to browser."""
+        try:
+            async for message in self.openai_ws:
+                try:
+                    event = json.loads(message)
+                    event_type = event.get("type")
+                    
+                    # Forward relevant events to browser
+                    if event_type == "response.audio.delta":
+                        # Stream audio chunks to browser
+                        audio_delta = event.get("delta")
+                        if audio_delta:
+                            await self.send(text_data=json.dumps({
+                                "type": "audio_delta",
+                                "audio": audio_delta
+                            }))
+                    
+                    elif event_type == "response.audio_transcript.delta":
+                        # Stream transcript
+                        transcript_delta = event.get("delta")
+                        if transcript_delta:
+                            await self.send(text_data=json.dumps({
+                                "type": "transcript_delta",
+                                "text": transcript_delta,
+                                "role": "assistant"
+                            }))
+                    
+                    elif event_type == "conversation.item.input_audio_transcription.completed":
+                        # User's speech transcription
+                        transcript = event.get("transcript", "")
+                        await self.send(text_data=json.dumps({
+                            "type": "user_transcript",
+                            "text": transcript
+                        }))
+                    
+                    elif event_type == "response.done":
+                        # Response completed
+                        await self.send(text_data=json.dumps({
+                            "type": "response_done"
+                        }))
+                    
+                    elif event_type == "error":
+                        # Error from OpenAI
+                        error_message = event.get("error", {}).get("message", "Unknown error")
+                        logger.error(f"OpenAI error: {error_message}")
+                        await self.send(text_data=json.dumps({
+                            "type": "error",
+                            "message": f"AI error: {error_message}"
+                        }))
+                    
+                    # Log other events for debugging
+                    else:
+                        logger.debug(f"OpenAI event: {event_type}")
+                        
+                except json.JSONDecodeError:
+                    logger.error("Failed to decode OpenAI message")
+                except Exception as e:
+                    logger.error(f"Error processing OpenAI message: {e}")
+                    
+        except websockets.exceptions.ConnectionClosed:
+            logger.info("OpenAI WebSocket connection closed")
+            await self.send(text_data=json.dumps({
+                "type": "ai_disconnected",
+                "message": "AI connection closed"
+            }))
+        except Exception as e:
+            logger.error(f"Error in OpenAI listener: {e}")
+            await self.send(text_data=json.dumps({
+                "type": "error",
+                "message": f"AI listener error: {str(e)}"
+            }))
+    
+    async def send_audio_to_openai(self, audio_base64: str):
+        """Send audio data to OpenAI Realtime API."""
+        if not self.openai_ws:
+            return
+        
+        try:
+            audio_event = {
+                "type": "input_audio_buffer.append",
+                "audio": audio_base64
+            }
+            await self.openai_ws.send(json.dumps(audio_event))
+        except Exception as e:
+            logger.error(f"Error sending audio to OpenAI: {e}")
+    
+    async def send_audio_bytes_to_openai(self, audio_bytes: bytes):
+        """Send binary audio data to OpenAI Realtime API."""
+        if not self.openai_ws:
+            return
+        
+        try:
+            # Convert bytes to base64
+            audio_base64 = base64.b64encode(audio_bytes).decode('utf-8')
+            await self.send_audio_to_openai(audio_base64)
+        except Exception as e:
+            logger.error(f"Error sending audio bytes to OpenAI: {e}")
+    
+    async def end_session(self):
+        """End the interview session."""
+        try:
+            if self.openai_ws:
+                await self.openai_ws.close()
+                self.openai_ws = None
+            
+            await self.send(text_data=json.dumps({
+                "type": "session_ended",
+                "message": "Interview session ended"
+            }))
+            
+            logger.info(f"Session ended for session_id: {self.session_id}")
+            
+        except Exception as e:
+            logger.error(f"Error ending session: {e}")
+>>>>>>> cad8c1536560a782f1aa7792d7fc9a59347a1680

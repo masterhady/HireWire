@@ -3,10 +3,13 @@ WebSocket URL routing for Django Channels.
 """
 
 from django.urls import path
-from api.consumers import RealtimeInterviewConsumer
+# Use the OpenAI realtime consumer implementation for realtime interview endpoints.
 from api.openai_realtime_consumer import OpenAIRealtimeInterviewConsumer
 
+
 websocket_urlpatterns = [
-    path('ws/realtime-interview/', RealtimeInterviewConsumer.as_asgi()),
+    # Backward-compatible route
+    path('ws/realtime-interview/', OpenAIRealtimeInterviewConsumer.as_asgi()),
+    # Explicit OpenAI realtime route
     path('ws/openai-realtime-interview/', OpenAIRealtimeInterviewConsumer.as_asgi()),
 ]

@@ -24,6 +24,7 @@ INSTALLED_APPS = [
     "rest_framework",
     "rest_framework_simplejwt",
     "corsheaders",
+    "channels",  # WebSocket support
     "api",
 ]
 
@@ -60,6 +61,42 @@ TEMPLATES = [
 
 WSGI_APPLICATION = "core.wsgi.application"
 
+# ASGI Application for WebSocket support
+ASGI_APPLICATION = "core.asgi.application"
+
+# Channel Layers for WebSocket
+# Using InMemoryChannelLayer for development (no Redis required)
+# For production, switch to RedisChannelLayer
+CHANNEL_LAYERS = {
+    "default": {
+        "BACKEND": "channels.layers.InMemoryChannelLayer"
+    },
+}
+
+# Production Redis configuration (commented out for development):
+# CHANNEL_LAYERS = {
+#     "default": {
+#         "BACKEND": "channels_redis.core.RedisChannelLayer",
+#         "CONFIG": {
+#             "hosts": [(config("REDIS_HOST", default="127.0.0.1"), config("REDIS_PORT", default=6379, cast=int))],
+#         },
+#     },
+# }
+
+
+# Password Hashers - Optimized for Development Speed
+# Using 1 iteration of PBKDF2 to make login instantaneous in dev
+PASSWORD_HASHERS = [
+    "django.contrib.auth.hashers.PBKDF2PasswordHasher",
+    "django.contrib.auth.hashers.PBKDF2SHA1PasswordHasher",
+    "django.contrib.auth.hashers.Argon2PasswordHasher",
+    "django.contrib.auth.hashers.BCryptSHA256PasswordHasher",
+]
+
+# Reduce iterations for PBKDF2 to 1 (default is 600,000+)
+from django.contrib.auth.hashers import PBKDF2PasswordHasher
+PBKDF2PasswordHasher.iterations = 1
+
 # Database
 USE_SQLITE = config("USE_SQLITE", cast=bool, default=False)
 if USE_SQLITE:
@@ -71,13 +108,24 @@ if USE_SQLITE:
     }
 else:
     # Supabase PostgreSQL via Connection Pooling
+    db_host = config("DB_HOST")
+    
+    # FIX: Resolve hostname to IPv4 to avoid IPv6 timeouts (saves ~15s)
+    import socket
+    try:
+        # Force IPv4 resolution
+        db_host = socket.gethostbyname(db_host)
+        print(f"Resolved DB_HOST to {db_host} (IPv4) to avoid timeouts")
+    except Exception as e:
+        print(f"Could not resolve DB_HOST {db_host}: {e}")
+
     DATABASES = {
         "default": {
             "ENGINE": "django.db.backends.postgresql",
             "NAME": config("DB_NAME"),
             "USER": config("DB_USER"),
             "PASSWORD": config("DB_PASSWORD"),
-            "HOST": config("DB_HOST"),
+            "HOST": db_host,
             "PORT": config("DB_PORT", cast=int),
             "OPTIONS": {
                 "sslmode": config("DB_SSLMODE", default="require"),
@@ -120,11 +168,11 @@ REST_FRAMEWORK = {
     ),
 }
 
-# SimpleJWT settings (optional defaults)
+# SimpleJWT settings
 from datetime import timedelta
 SIMPLE_JWT = {
-    "ACCESS_TOKEN_LIFETIME": timedelta(minutes=60),
-    "REFRESH_TOKEN_LIFETIME": timedelta(days=7),
+    "ACCESS_TOKEN_LIFETIME": timedelta(hours=24),  # Extended to 24 hours for development
+    "REFRESH_TOKEN_LIFETIME": timedelta(days=30),  # Extended to 30 days
 }
 
 # CORS

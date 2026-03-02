@@ -1,0 +1,33 @@
+[
+  {
+    "id": "backend_engineer",
+    "cv_text": "Senior backend engineer with 8+ years in Python, FastAPI, and PostgreSQL. Built matching engines for recruiting platforms and optimized ETL pipelines for talent analytics.",
+    "expected_keywords": [
+      "backend",
+      "python",
+      "recruiting"
+    ],
+    "notes": "Should highlight technical fit and data-heavy job recommendations."
+  },
+  {
+    "id": "sales_ae",
+    "cv_text": "Enterprise account executive with consistent 130% quota attainment. Led SaaS sales cycles, negotiated multi-year contracts, and built C-level relationships in fintech.",
+    "expected_keywords": [
+      "sales",
+      "enterprise",
+      "saas"
+    ],
+    "notes": "Ensures business-focused resumes surface go-to-market roles."
+  },
+  {
+    "id": "data_scientist",
+    "cv_text": "Data scientist specialized in NLP, vector databases, and LLM prompt engineering. Delivered ranking models, AB tests, and ML monitoring dashboards.",
+    "expected_keywords": [
+      "data",
+      "ml",
+      "nlp"
+    ],
+    "notes": "Validates AI-heavy profiles keep surfacing technical AI roles."
+  }
+]
+

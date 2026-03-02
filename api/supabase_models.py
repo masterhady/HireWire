@@ -112,6 +112,77 @@ class Application(models.Model):
         db_table = "applications"
 
 
+# Application Tracking Models (Django-managed for new features)
+class ApplicationStatus(models.Model):
+    """Tracks application status changes"""
+    STATUS_CHOICES = [
+        ('applied', 'Applied'),
+        ('viewed', 'Viewed'),
+        ('screening', 'Screening'),
+        ('interview', 'Interview'),
+        ('interviewing', 'Interviewing'),
+        ('offer', 'Offer'),
+        ('rejected', 'Rejected'),
+        ('withdrawn', 'Withdrawn'),
+        ('accepted', 'Accepted'),
+    ]
+    
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    application = models.ForeignKey(Application, models.DO_NOTHING, db_column="application_id", related_name="statuses")
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='applied')
+    notes = models.TextField(blank=True, null=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    
+    class Meta:
+        db_table = "application_statuses"
+        ordering = ['-created_at']
+        get_latest_by = 'created_at'
+
+
+class ApplicationNote(models.Model):
+    """Stores notes for applications"""
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    application = models.ForeignKey(Application, models.DO_NOTHING, db_column="application_id", related_name="notes")
+    note = models.TextField()
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    
+    class Meta:
+        db_table = "application_notes"
+        ordering = ['-created_at']
+
+
+class CoverLetter(models.Model):
+    """Stores generated cover letters"""
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    user = models.ForeignKey(SbUser, models.DO_NOTHING, db_column="user_id", related_name="cover_letters")
+    cv = models.ForeignKey(CV, models.DO_NOTHING, db_column="cv_id", related_name="cover_letters")
+    job = models.ForeignKey(Job, models.DO_NOTHING, db_column="job_id", blank=True, null=True, related_name="cover_letters")
+    job_description = models.TextField(blank=True, null=True)  # Manual entry if no job
+    cover_letter_text = models.TextField()
+    version_name = models.CharField(max_length=200, default="Version 1")
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    
+    class Meta:
+        db_table = "cover_letters"
+        ordering = ['-created_at']
+
+
+class ApplicationCoverLetter(models.Model):
+    """Links applications to cover letters"""
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    application = models.ForeignKey(Application, models.DO_NOTHING, db_column="application_id", related_name="cover_letter_links")
+    cover_letter = models.ForeignKey(CoverLetter, models.DO_NOTHING, db_column="cover_letter_id", related_name="application_links")
+    created_at = models.DateTimeField(auto_now_add=True)
+    
+    class Meta:
+        db_table = "application_cover_letters"
+        ordering = ['-created_at']
+        unique_together = [['application', 'cover_letter']]
+
+
 class Recommendation(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     application = models.ForeignKey(Application, models.DO_NOTHING, db_column="application_id")

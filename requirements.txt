@@ -14,3 +14,13 @@ langchain>=0.2.12
 langchain-core>=0.2.37
 langchain-community>=0.2.11
 langchain-fireworks==0.1.7
+beautifulsoup4>=4.12.0
+lxml>=4.9.0
+giskard>=2.9.0
+pandas>=2.2.0
+# WebSocket and Realtime API dependencies
+channels>=4.0.0
+channels-redis>=4.1.0
+daphne>=4.0.0
+websockets>=12.0
+openpyxl>=3.1.0

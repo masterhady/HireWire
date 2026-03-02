@@ -8,6 +8,7 @@ import uuid
 from django.core.files.base import ContentFile
 from django.core.files.storage import default_storage
 from django.http import HttpResponse
+from typing import Optional
 
 from .supabase_models import (
     SbCompany,
@@ -18,6 +19,10 @@ from .supabase_models import (
     Job,
     JobEmbedding,
     Application,
+    ApplicationStatus,
+    ApplicationNote,
+    CoverLetter,
+    ApplicationCoverLetter,
     Recommendation,
     InterviewSession,
     InterviewQuestion,
@@ -37,6 +42,9 @@ from .supabase_serializers import (
     JobSerializer,
     JobEmbeddingSerializer,
     ApplicationSerializer,
+    ApplicationStatusSerializer,
+    ApplicationNoteSerializer,
+    CoverLetterSerializer,
     RecommendationSerializer,
     InterviewSessionSerializer,
     InterviewQuestionSerializer,
@@ -61,8 +69,171 @@ import base64
 import random
 import json
 import requests
+from bs4 import BeautifulSoup
+from urllib.parse import urljoin
+
+# Import OpenAI for conversational interview
+try:
+    from openai import OpenAI
+except Exception:
+    OpenAI = None
 
 EMB_DIM = config("FIREWORKS_EMBEDDING_DIM", default=None, cast=int)
+
+
+def search_maharatech_courses(skill_name: str, max_results: int = 3) -> list:
+    """
+    Search for courses on MaharaTech (maharatech.gov.eg) related to a skill.
+    Returns a list of course dictionaries with 'title' and 'url' keys.
+    If no courses are found, returns an empty list.
+    """
+    try:
+        base_url = "https://maharatech.gov.eg"
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9,ar;q=0.8",
+        }
+        courses = []
+        
+        # Try multiple search approaches
+        search_urls = [
+            f"{base_url}/course/search.php",
+            f"{base_url}/search/index.php",
+        ]
+        
+        for search_url in search_urls:
+            try:
+                # Prepare search parameters for Moodle
+                search_params = {
+                    "q": skill_name,
+                }
+                
+                # Try with areaids parameter (Moodle-specific)
+                response = requests.get(
+                    search_url,
+                    params={**search_params, "areaids": "core_course-course"},
+                    headers=headers,
+                    timeout=10,
+                    allow_redirects=True
+                )
+                
+                if not response.ok:
+                    # Try without areaids
+                    response = requests.get(
+                        search_url,
+                        params=search_params,
+                        headers=headers,
+                        timeout=10,
+                        allow_redirects=True
+                    )
+                
+                if not response.ok:
+                    continue
+                
+                # Parse HTML
+                soup = BeautifulSoup(response.content, 'lxml')
+                
+                # Method 1: Look for course links in search results
+                # Moodle course links typically contain '/course/view.php?id=' or '/course/'
+                course_links = soup.find_all('a', href=re.compile(r'/course/(view\.php|index\.php)'))
+                
+                for link in course_links:
+                    href = link.get('href', '')
+                    title = link.get_text(strip=True)
+                    
+                    # Clean up title - get text from link or parent elements
+                    if not title or len(title) < 5:
+                        # Try to get title from parent or sibling elements
+                        parent = link.find_parent(['div', 'li', 'article', 'section'])
+                        if parent:
+                            title_elem = parent.find(['h1', 'h2', 'h3', 'h4', 'span', 'div'], class_=re.compile(r'title|name|course'))
+                            if title_elem:
+                                title = title_elem.get_text(strip=True)
+                    
+                    if title and len(title) > 5:
+                        # Make URL absolute
+                        course_url = urljoin(base_url, href) if not href.startswith('http') else href
+                        
+                        # Ensure URL is from MaharaTech domain only
+                        if 'maharatech.gov.eg' not in course_url:
+                            continue
+                        
+                        # Avoid duplicates and filter out non-course pages
+                        if (course_url not in [c['url'] for c in courses] and 
+                            ('/course/view.php?id=' in course_url or '/course/index.php' in course_url)):
+                            courses.append({
+                                'title': title[:200],  # Limit title length
+                                'url': course_url
+                            })
+                            
+                            if len(courses) >= max_results:
+                                break
+                
+                # Method 2: Look for course cards/containers
+                if len(courses) < max_results:
+                    course_containers = soup.find_all(['div', 'article', 'li'], 
+                                                      class_=re.compile(r'course|result|item|card'),
+                                                      attrs={'data-courseid': True})
+                    
+                    for container in course_containers:
+                        link = container.find('a', href=re.compile(r'course'))
+                        if not link:
+                            continue
+                        
+                        href = link.get('href', '')
+                        title = link.get_text(strip=True)
+                        
+                        # Try to find title in container
+                        if not title or len(title) < 5:
+                            title_elem = container.find(['h1', 'h2', 'h3', 'h4'], 
+                                                       class_=re.compile(r'title|name'))
+                            if title_elem:
+                                title = title_elem.get_text(strip=True)
+                        
+                        if title and len(title) > 5:
+                            course_url = urljoin(base_url, href) if not href.startswith('http') else href
+                            
+                            # Ensure URL is from MaharaTech domain only
+                            if 'maharatech.gov.eg' not in course_url:
+                                continue
+                            
+                            if (course_url not in [c['url'] for c in courses] and 
+                                '/course/' in course_url):
+                                courses.append({
+                                    'title': title[:200],
+                                    'url': course_url
+                                })
+                                
+                                if len(courses) >= max_results:
+                                    break
+                
+                # If we found courses, break out of the loop
+                if courses:
+                    break
+                    
+            except Exception as e:
+                # Continue to next search URL if this one fails
+                continue
+        
+        # Filter and clean results
+        unique_courses = []
+        seen_urls = set()
+        for course in courses:
+            if course['url'] not in seen_urls:
+                seen_urls.add(course['url'])
+                unique_courses.append(course)
+                if len(unique_courses) >= max_results:
+                    break
+        
+        return unique_courses[:max_results]
+        
+    except Exception as e:
+        # Log error but don't fail the request - return empty list
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.warning(f"Error searching MaharaTech for '{skill_name}': {e}")
+        return []
 
 
 class CompanyViewSet(viewsets.ModelViewSet):
@@ -202,7 +373,7 @@ class ApplicationViewSet(viewsets.ModelViewSet):
     @action(detail=False, methods=["get"], url_path=r"company/(?P<company_id>[^/]+)/dashboard-stats")
     def company_dashboard_stats(self, request, company_id=None):
         """Get dashboard stats for a company user."""
-        if not request.user.is_authenticated:
+        if not hasattr(request, 'user') or not request.user or not request.user.is_authenticated:
             return Response({"detail": "Authentication required"}, status=401)
         
         try:
@@ -226,7 +397,8 @@ class ApplicationViewSet(viewsets.ModelViewSet):
     @action(detail=False, methods=["get"], url_path=r"company/(?P<company_id>[^/]+)/recent-applications")
     def company_recent_applications(self, request, company_id=None):
         """Get recent applications for a company user."""
-        if not request.user.is_authenticated:
+        # Check if user is authenticated - removed the incorrect check
+        if not hasattr(request, 'user') or not request.user or not request.user.is_authenticated:
             return Response({"detail": "Authentication required"}, status=401)
         
         try:
@@ -257,15 +429,198 @@ class ApplicationViewSet(viewsets.ModelViewSet):
         except Exception as e:
             return Response({"detail": str(e)}, status=500)
 
+    @action(detail=False, methods=["get"], url_path="tracking/my-applications")
+    def my_applications(self, request):
+        """Get all applications for the current user (job seeker) with tracking info."""
+        if not request.user.is_authenticated:
+            return Response({"detail": "Authentication required"}, status=401)
+        
+        try:
+            # Get user's CVs
+            auth_email = getattr(request.user, "email", None)
+            if not auth_email:
+                return Response({"detail": "User email not found"}, status=400)
+            
+            sb_user = SbUser.objects.filter(email=auth_email).first()
+            if not sb_user:
+                return Response({"detail": "Supabase user not found"}, status=404)
+            
+            # Get applications for user's CVs
+            applications = Application.objects.filter(cv__user_id=sb_user.id).order_by('-matched_at')
+            
+            # Filter by status if provided
+            status_filter = request.query_params.get('status')
+            if status_filter:
+                application_ids = ApplicationStatus.objects.filter(
+                    status=status_filter
+                ).values_list('application_id', flat=True).distinct()
+                applications = applications.filter(id__in=application_ids)
+            
+            serializer = ApplicationSerializer(applications, many=True)
+            return Response(serializer.data, status=200)
+        except Exception as e:
+            return Response({"detail": str(e)}, status=500)
+
+    @action(detail=True, methods=["post"], url_path="tracking/update-status")
+    def update_status(self, request, pk=None):
+        """Update application status. Only companies can update status."""
+        if not request.user.is_authenticated:
+            return Response({"detail": "Authentication required"}, status=401)
+        
+        try:
+            application = self.get_object()
+            
+            # Check if user is the company that posted the job
+            # Only companies can update application status
+            if application.job.company != request.user:
+                return Response({
+                    "detail": "Only the company that posted this job can update application status"
+                }, status=403)
+            
+            status = request.data.get('status')
+            notes = request.data.get('notes', '')
+            
+            if not status:
+                return Response({"detail": "Status is required"}, status=400)
+            
+            # Create new status entry
+            status_obj = ApplicationStatus.objects.create(
+                application=application,
+                status=status,
+                notes=notes
+            )
+            
+            serializer = ApplicationStatusSerializer(status_obj)
+            return Response(serializer.data, status=201)
+        except Application.DoesNotExist:
+            return Response({"detail": "Application not found"}, status=404)
+        except Exception as e:
+            return Response({"detail": str(e)}, status=500)
+
+    @action(detail=True, methods=["post"], url_path="tracking/add-note")
+    def add_note(self, request, pk=None):
+        """Add a note to an application."""
+        if not request.user.is_authenticated:
+            return Response({"detail": "Authentication required"}, status=401)
+        
+        try:
+            application = self.get_object()
+            note_text = request.data.get('note')
+            
+            if not note_text:
+                return Response({"detail": "Note is required"}, status=400)
+            
+            note = ApplicationNote.objects.create(
+                application=application,
+                note=note_text
+            )
+            
+            serializer = ApplicationNoteSerializer(note)
+            return Response(serializer.data, status=201)
+        except Application.DoesNotExist:
+            return Response({"detail": "Application not found"}, status=404)
+        except Exception as e:
+            return Response({"detail": str(e)}, status=500)
+
+    @action(detail=True, methods=["get"], url_path="tracking/notes")
+    def get_notes(self, request, pk=None):
+        """Get all notes for an application."""
+        if not request.user.is_authenticated:
+            return Response({"detail": "Authentication required"}, status=401)
+        
+        try:
+            application = self.get_object()
+            notes = ApplicationNote.objects.filter(application=application).order_by('-created_at')
+            serializer = ApplicationNoteSerializer(notes, many=True)
+            return Response(serializer.data, status=200)
+        except Application.DoesNotExist:
+            return Response({"detail": "Application not found"}, status=404)
+        except Exception as e:
+            return Response({"detail": str(e)}, status=500)
+
+    @action(detail=True, methods=["get"], url_path="tracking/timeline")
+    def get_timeline(self, request, pk=None):
+        """Get timeline of status changes and notes for an application."""
+        if not request.user.is_authenticated:
+            return Response({"detail": "Authentication required"}, status=401)
+        
+        try:
+            application = self.get_object()
+            timeline = []
+            
+            # Get status history
+            statuses = ApplicationStatus.objects.filter(application=application).order_by('-created_at')
+            for status in statuses:
+                timeline.append({
+                    'type': 'status',
+                    'status': status.status,
+                    'status_display': status.get_status_display(),
+                    'notes': status.notes,
+                    'created_at': status.created_at.isoformat() if status.created_at else None,
+                })
+            
+            # Get notes
+            notes = ApplicationNote.objects.filter(application=application).order_by('-created_at')
+            for note in notes:
+                timeline.append({
+                    'type': 'note',
+                    'note': note.note,
+                    'created_at': note.created_at.isoformat() if note.created_at else None,
+                })
+            
+            # Sort by created_at (most recent first)
+            timeline.sort(key=lambda x: x.get('created_at', ''), reverse=True)
+            
+            return Response(timeline, status=200)
+        except Application.DoesNotExist:
+            return Response({"detail": "Application not found"}, status=404)
+        except Exception as e:
+            return Response({"detail": str(e)}, status=500)
+
+    @action(detail=False, methods=["get"], url_path="tracking/statistics")
+    def get_statistics(self, request):
+        """Get application statistics for the current user."""
+        if not request.user.is_authenticated:
+            return Response({"detail": "Authentication required"}, status=401)
+        
+        try:
+            # Get user's CVs
+            auth_email = getattr(request.user, "email", None)
+            if not auth_email:
+                return Response({"detail": "User email not found"}, status=400)
+            
+            sb_user = SbUser.objects.filter(email=auth_email).first()
+            if not sb_user:
+                return Response({"detail": "Supabase user not found"}, status=404)
+            
+            # Get applications for user's CVs
+            applications = Application.objects.filter(cv__user_id=sb_user.id)
+            total_applications = applications.count()
+            
+            # Get status counts
+            status_counts = {}
+            for app in applications:
+                latest_status = ApplicationStatus.objects.filter(application=app).first()
+                status = latest_status.status if latest_status else 'applied'
+                status_counts[status] = status_counts.get(status, 0) + 1
+            
+            return Response({
+                'total_applications': total_applications,
+                'status_counts': status_counts,
+            }, status=200)
+        except Exception as e:
+            return Response({"detail": str(e)}, status=500)
+
     @action(detail=False, methods=["post"], url_path="apply")
     def apply(self, request):
         """Create an application from a job seeker CV and job id.
         Expects: { cv: <uuid>, job: <uuid> }
-        Optionally: { match_score: <number> }
+        Optionally: { match_score: <number>, cover_letter_id: <uuid> }
         """
         cv_id = request.data.get("cv")
         job_id = request.data.get("job")
         match_score = request.data.get("match_score")
+        cover_letter_id = request.data.get("cover_letter_id")
         if not cv_id or not job_id:
             return Response({"detail": "cv and job are required"}, status=400)
         try:
@@ -274,44 +629,95 @@ class ApplicationViewSet(viewsets.ModelViewSet):
         except Exception:
             return Response({"detail": "cv or job not found"}, status=404)
 
-        # Resolve company for the application: prefer direct mapping via job.company_id to companies.id
+        # Check if application already exists first
+        existing = Application.objects.filter(cv=cv, job=job).first()
+        if existing:
+            # Ensure initial status exists
+            if not ApplicationStatus.objects.filter(application=existing).exists():
+                ApplicationStatus.objects.create(
+                    application=existing,
+                    status='applied',
+                    notes='Application created'
+                )
+            # Attach cover letter if provided and not already attached
+            if cover_letter_id:
+                try:
+                    cover_letter = CoverLetter.objects.get(id=cover_letter_id)
+                    # Verify the cover letter belongs to the same user
+                    auth_user = getattr(request, "user", None)
+                    auth_email = getattr(auth_user, "email", None)
+                    sb_user = None
+                    if auth_email:
+                        sb_user = SbUser.objects.filter(email=auth_email).first()
+                    if sb_user and cover_letter.user_id == sb_user.id:
+                        ApplicationCoverLetter.objects.get_or_create(
+                            application=existing,
+                            cover_letter=cover_letter
+                        )
+                except CoverLetter.DoesNotExist:
+                    pass
+                except Exception:
+                    pass
+            return Response(self.get_serializer(existing).data, status=200)
+
+        # Resolve company for the application: map job.company (User) to SbCompany
         company_obj = None
         try:
-            from .supabase_models import SbCompany  # local import to avoid cycles
-            raw_company_id = getattr(job, "company_id", None)
-            if raw_company_id is not None:
-                try:
-                    company_obj = SbCompany.objects.filter(id=raw_company_id).first()
-                except Exception:
-                    company_obj = None
-            if not company_obj and getattr(job, "company", None):
-                possible_names = []
+            # job.company is a ForeignKey to AUTH_USER_MODEL (User)
+            # We need to find the corresponding SbCompany
+            if getattr(job, "company", None):
                 comp_user = job.company
-                if hasattr(comp_user, "get_full_name"):
-                    n = comp_user.get_full_name()
-                    if n:
-                        possible_names.append(n)
-                for attr in ("full_name", "username", "email"):
-                    v = getattr(comp_user, attr, None)
-                    if v:
-                        possible_names.append(str(v))
-                if possible_names:
-                    company_obj = SbCompany.objects.filter(name__in=possible_names).first()
-        except Exception:
-            company_obj = None
-
-        try:
-            # If an application already exists for this cv+job, return it
-            existing = Application.objects.filter(cv=cv, job=job).first()
-            if existing:
-                return Response(self.get_serializer(existing).data, status=200)
-
-            # As a last resort, fallback to any available company to avoid blocking applies
-            if company_obj is None:
-                try:
+                # Try to find SbCompany by matching user email or name
+                possible_names = []
+                
+                # Get user's email
+                user_email = getattr(comp_user, "email", None)
+                if user_email:
+                    # First try to find company by matching email pattern
+                    company_obj = SbCompany.objects.filter(name__icontains=user_email.split('@')[0]).first()
+                
+                # If not found, try other attributes
+                if not company_obj:
+                    if hasattr(comp_user, "get_full_name"):
+                        n = comp_user.get_full_name()
+                        if n:
+                            possible_names.append(n)
+                    for attr in ("full_name", "username", "email"):
+                        v = getattr(comp_user, attr, None)
+                        if v:
+                            possible_names.append(str(v))
+                    if possible_names:
+                        company_obj = SbCompany.objects.filter(name__in=possible_names).first()
+                
+                # If still not found, use the first company as fallback
+                if not company_obj:
                     company_obj = SbCompany.objects.first()
-                except Exception:
-                    company_obj = None
+        except Exception:
+            # Fallback to first available company
+            try:
+                company_obj = SbCompany.objects.first()
+            except Exception:
+                company_obj = None
+
+        # Ensure we have a company before creating application
+        # Since company filtering uses job__company (not application.company), 
+        # we can use any valid company as fallback
+        if company_obj is None:
+            # Try one more time to get ANY company
+            try:
+                company_obj = SbCompany.objects.first()
+            except Exception:
+                pass
+
+            # If still no company, we cannot create the application
+            # This should be rare - there should always be at least one company
+            if company_obj is None:
+                return Response({
+                    "detail": "Could not resolve company for this job. Please contact support."
+                }, status=400)
+            
+        try:
+            # Create the application - .create() works on unmanaged models if table exists
             app = Application.objects.create(
                 cv=cv,
                 job=job,
@@ -319,16 +725,295 @@ class ApplicationViewSet(viewsets.ModelViewSet):
                 match_score=match_score,
                 matched_at=timezone.now(),
             )
-        except Exception as e:
-            return Response({"detail": f"failed to create application: {e}"}, status=400)
+            
+            # Create initial status - this is critical for tracking
+            ApplicationStatus.objects.create(
+                application=app,
+                status='applied',
+                notes='Application submitted'
+            )
+            
+            # Attach cover letter if provided (non-critical, can fail silently)
+            if cover_letter_id:
+                try:
+                    cover_letter = CoverLetter.objects.get(id=cover_letter_id)
+                    # Verify the cover letter belongs to the same user
+                    auth_user = getattr(request, "user", None)
+                    auth_email = getattr(auth_user, "email", None)
+                    sb_user = None
+                    if auth_email:
+                        sb_user = SbUser.objects.filter(email=auth_email).first()
+                    if sb_user and cover_letter.user_id == sb_user.id:
+                        ApplicationCoverLetter.objects.get_or_create(
+                            application=app,
+                            cover_letter=cover_letter
+                        )
+                except CoverLetter.DoesNotExist:
+                    pass  # Silently ignore if cover letter not found
+                except Exception:
+                    pass  # Silently ignore errors attaching cover letter
 
-        return Response(self.get_serializer(app).data, status=201)
+            return Response(self.get_serializer(app).data, status=201)
+            
+        except Exception as e:
+            # Log the error for debugging
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.error(f"Failed to create application: {e}", exc_info=True)
+            return Response({"detail": f"Failed to create application: {str(e)}"}, status=400)
 
 
 class RecommendationViewSet(viewsets.ReadOnlyModelViewSet):
     queryset = Recommendation.objects.all()
     serializer_class = RecommendationSerializer
     permission_classes = [permissions.IsAuthenticated]
+
+
+class CoverLetterViewSet(viewsets.ModelViewSet):
+    """ViewSet for cover letter generation and management"""
+    serializer_class = CoverLetterSerializer
+    permission_classes = [permissions.IsAuthenticated]
+    
+    def get_queryset(self):
+        """Return cover letters for the authenticated user"""
+        # Resolve SbUser from Django User
+        auth_user = getattr(self.request, "user", None)
+        auth_email = getattr(auth_user, "email", None)
+        sb_user = None
+        if auth_email:
+            sb_user = SbUser.objects.filter(email=auth_email).first()
+        if not sb_user:
+            return CoverLetter.objects.none()
+        return CoverLetter.objects.filter(user_id=sb_user.id)
+    
+    @action(detail=False, methods=["post"], url_path="generate")
+    def generate(self, request):
+        """Generate a cover letter using AI based on CV and job description"""
+        if not request.user.is_authenticated:
+            return Response({"detail": "Authentication required"}, status=401)
+        
+        cv_id = request.data.get("cv_id")
+        job_id = request.data.get("job_id")
+        job_description = request.data.get("job_description", "")
+        tone = request.data.get("tone", "professional")  # professional, casual, creative
+        
+        # Get CV
+        cv_text = ""
+        if cv_id:
+            try:
+                cv = CV.objects.get(id=cv_id)
+                cv_text = cv.parsed_text or ""
+            except CV.DoesNotExist:
+                return Response({"detail": "CV not found"}, status=404)
+        else:
+            # Get latest CV for user - need to resolve SbUser from Django User
+            try:
+                auth_user = getattr(request, "user", None)
+                auth_email = getattr(auth_user, "email", None)
+                sb_user = None
+                if auth_email:
+                    sb_user = SbUser.objects.filter(email=auth_email).first()
+                if not sb_user:
+                    return Response({
+                        "detail": "Associated Supabase user not found for authenticated account",
+                        "hint": "Ensure a matching SbUser exists with the same email as the logged-in user",
+                    }, status=404)
+                latest_cv = CV.objects.filter(user_id=sb_user.id).order_by("-created_at").first()
+                if not latest_cv:
+                    return Response({
+                        "detail": "No uploaded CV found for the authenticated user",
+                        "hint": "Upload a CV first using /api/rag/cv-upload/",
+                    }, status=404)
+                cv_text = latest_cv.parsed_text or ""
+            except Exception as e:
+                return Response({"detail": f"Error fetching CV: {str(e)}"}, status=400)
+        
+        if not cv_text:
+            return Response({"detail": "CV text is empty"}, status=400)
+        
+        # Get job description
+        job_title = ""
+        company_name = ""
+        if job_id:
+            try:
+                job = Job.objects.get(id=job_id)
+                job_description = job.description or job_description
+                job_title = job.title or ""
+                # Try to get company name
+                try:
+                    if job.company:
+                        company_name = getattr(job.company, "name", "") or ""
+                except Exception:
+                    pass
+            except Job.DoesNotExist:
+                return Response({"detail": "Job not found"}, status=404)
+        
+        if not job_description:
+            return Response({"detail": "Job description is required"}, status=400)
+        
+        # Call Fireworks for cover letter generation
+        if not FIREWORKS_API_KEY:
+            return Response({
+                "detail": "FIREWORKS_API_KEY is not set",
+                "hint": "Configure FIREWORKS_API_KEY in environment",
+            }, status=400)
+        
+        tone_instructions = {
+            "professional": "Write in a formal, professional tone suitable for corporate environments.",
+            "casual": "Write in a friendly, approachable tone while maintaining professionalism.",
+            "creative": "Write in an engaging, creative tone that showcases personality while remaining professional.",
+        }
+        
+        system_prompt = (
+            "You are an expert cover letter writer. Generate compelling, personalized cover letters "
+            "that effectively match the candidate's CV with the job requirements. "
+            f"{tone_instructions.get(tone, tone_instructions['professional'])} "
+            "The cover letter should be 300-400 words, well-structured, and highlight relevant skills and experiences."
+        )
+        
+        user_prompt = (
+            f"Candidate CV:\n{cv_text}\n\n"
+            f"Job Title: {job_title}\n"
+            f"Company: {company_name}\n"
+            f"Job Description:\n{job_description}\n\n"
+            "Generate a compelling cover letter that:\n"
+            "- Highlights relevant skills and experiences from the CV\n"
+            "- Addresses the job requirements directly\n"
+            "- Shows genuine enthusiasm for the role\n"
+            "- Demonstrates understanding of the company/position\n"
+            "- Is professional, concise, and well-structured (300-400 words)\n"
+            "- Includes a proper greeting and closing\n\n"
+            "Return ONLY the cover letter text, no additional commentary or formatting instructions."
+        )
+        
+        try:
+            url = f"{FIREWORKS_BASE_URL}/chat/completions"
+            model_name = config("FIREWORKS_CHAT_MODEL", default="accounts/fireworks/models/llama-v3p3-70b-instruct")
+            headers = {
+                "Authorization": f"Bearer {FIREWORKS_API_KEY}",
+                "Content-Type": "application/json",
+            }
+            payload = {
+                "model": model_name,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                "temperature": 0.7,
+            }
+            r = requests.post(url, headers=headers, json=payload, timeout=60)
+            if not r.ok:
+                return Response({"detail": f"Fireworks error: {r.status_code}", "body": r.text}, status=400)
+            data_resp = r.json()
+            cover_letter_text = data_resp.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+        except Exception as e:
+            return Response({"detail": f"Model call failed: {e}"}, status=400)
+        
+        if not cover_letter_text:
+            return Response({"detail": "Failed to generate cover letter"}, status=400)
+        
+        # Get CV for saving (if cv_id provided) - need to resolve SbUser
+        cv_obj = None
+        auth_user = getattr(request, "user", None)
+        auth_email = getattr(auth_user, "email", None)
+        sb_user = None
+        if auth_email:
+            sb_user = SbUser.objects.filter(email=auth_email).first()
+        
+        if cv_id:
+            try:
+                cv_obj = CV.objects.get(id=cv_id)
+            except CV.DoesNotExist:
+                pass
+        else:
+            if sb_user:
+                cv_obj = CV.objects.filter(user_id=sb_user.id).order_by("-created_at").first()
+        
+        # Get job for saving (if job_id provided)
+        job_obj = None
+        if job_id:
+            try:
+                job_obj = Job.objects.get(id=job_id)
+            except Job.DoesNotExist:
+                pass
+        
+        return Response({
+            "cover_letter": cover_letter_text,
+            "cv_id": str(cv_obj.id) if cv_obj else None,
+            "job_id": str(job_obj.id) if job_obj else None,
+            "job_title": job_title,
+            "company_name": company_name,
+        }, status=200)
+    
+    @action(detail=False, methods=["post"], url_path="save")
+    def save_version(self, request):
+        """Save a cover letter version"""
+        if not request.user.is_authenticated:
+            return Response({"detail": "Authentication required"}, status=401)
+        
+        cover_letter_text = request.data.get("cover_letter")
+        cv_id = request.data.get("cv_id")
+        job_id = request.data.get("job_id")
+        job_description = request.data.get("job_description", "")
+        version_name = request.data.get("version_name", "Version 1")
+        
+        if not cover_letter_text:
+            return Response({"detail": "Cover letter text is required"}, status=400)
+        
+        # Get CV - need to resolve SbUser from Django User
+        cv_obj = None
+        auth_user = getattr(request, "user", None)
+        auth_email = getattr(auth_user, "email", None)
+        sb_user = None
+        if auth_email:
+            sb_user = SbUser.objects.filter(email=auth_email).first()
+        if not sb_user:
+            return Response({
+                "detail": "Associated Supabase user not found for authenticated account",
+                "hint": "Ensure a matching SbUser exists with the same email as the logged-in user",
+            }, status=404)
+        
+        if cv_id:
+            try:
+                cv_obj = CV.objects.get(id=cv_id, user_id=sb_user.id)
+            except CV.DoesNotExist:
+                return Response({"detail": "CV not found"}, status=404)
+        else:
+            cv_obj = CV.objects.filter(user_id=sb_user.id).order_by("-created_at").first()
+            if not cv_obj:
+                return Response({"detail": "No CV found"}, status=404)
+        
+        # Get job (optional)
+        job_obj = None
+        if job_id:
+            try:
+                job_obj = Job.objects.get(id=job_id)
+            except Job.DoesNotExist:
+                pass
+        
+        # Count existing versions for this CV+Job combination to suggest next version name
+        existing_count = CoverLetter.objects.filter(
+            user_id=sb_user.id,
+            cv=cv_obj,
+            job=job_obj if job_obj else None
+        ).count()
+        
+        if existing_count > 0 and version_name == "Version 1":
+            version_name = f"Version {existing_count + 1}"
+        
+        try:
+            cover_letter = CoverLetter.objects.create(
+                user_id=sb_user.id,
+                cv=cv_obj,
+                job=job_obj,
+                job_description=job_description if not job_obj else None,
+                cover_letter_text=cover_letter_text,
+                version_name=version_name,
+            )
+            serializer = CoverLetterSerializer(cover_letter)
+            return Response(serializer.data, status=201)
+        except Exception as e:
+            return Response({"detail": str(e)}, status=500)
 
 
 class RAGSearchView(APIView):
@@ -477,7 +1162,7 @@ class CVMatchView(APIView):
         cv_id = request.data.get("cv_id")
         cv_text = request.data.get("cv_text")
         top_n = int(request.data.get("top_n", 5))
-        similarity_threshold = float(request.data.get("similarity_threshold", 0.5))
+        similarity_threshold = float(request.data.get("similarity_threshold", 0.6))
         must_contain = request.data.get("must_contain") or []
         must_not_contain = request.data.get("must_not_contain") or []
 
@@ -962,7 +1647,7 @@ class CVRecommendationsView(APIView):
 
         try:
             url = f"{FIREWORKS_BASE_URL}/chat/completions"
-            model_name = config("FIREWORKS_CHAT_MODEL", default="accounts/fireworks/models/llama-v3p1-70b-instruct")
+            model_name = config("FIREWORKS_CHAT_MODEL", default="accounts/fireworks/models/llama-v3p3-70b-instruct")
             headers = {
                 "Authorization": f"Bearer {FIREWORKS_API_KEY}",
                 "Content-Type": "application/json",
@@ -1034,6 +1719,165 @@ class CVRecommendationsView(APIView):
         return Response(result, status=200)
 
 
+class CVRewriteView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def _resolve_cv_text(self, request, cv_id: Optional[str], cv_text: Optional[str]):
+        """Resolve CV text from provided cv_id/cv_text or latest CV.
+
+        Returns tuple: (cv_text or None, error_response or None)
+        """
+        if cv_id and not cv_text:
+            try:
+                cv_obj = CV.objects.get(id=cv_id)
+                cv_text = cv_obj.parsed_text or ""
+            except CV.DoesNotExist:
+                return None, Response({"detail": "cv_id not found"}, status=404)
+
+        if not cv_id and not cv_text:
+            auth_user = getattr(request, "user", None)
+            auth_email = getattr(auth_user, "email", None)
+            sb_user = None
+            if auth_email:
+                sb_user = SbUser.objects.filter(email=auth_email).first()
+            if not sb_user:
+                return None, Response({
+                    "detail": "Associated Supabase user not found for authenticated account",
+                    "hint": "Ensure a matching SbUser exists with the same email as the logged-in user",
+                }, status=404)
+            latest_cv = CV.objects.filter(user_id=sb_user.id).order_by('-created_at').first()
+            if not latest_cv:
+                return None, Response({
+                    "detail": "No uploaded CV found for the authenticated user",
+                    "hint": "Upload a CV first using /api/rag/cv-upload/",
+                }, status=404)
+            cv_text = latest_cv.parsed_text or ""
+
+        if not cv_text:
+            return None, Response({"detail": "cv_text is empty"}, status=400)
+
+        return cv_text, None
+
+    def post(self, request):
+        """
+        Rewrite/improve a CV using AI, applying the provided suggestions/improvement plan.
+
+        Body:
+          - cv_id (optional)
+          - cv_text (optional)
+          - job_description (optional)
+          - tone (optional, default 'professional')
+          - suggestions (optional array of suggestion dicts/strings)
+        """
+        cv_id = request.data.get("cv_id")
+        cv_text = request.data.get("cv_text")
+        job_description = (request.data.get("job_description") or "").strip()
+        tone = request.data.get("tone", "professional")
+        suggestions = request.data.get("suggestions") or []
+
+        if not FIREWORKS_API_KEY:
+            return Response({
+                "detail": "FIREWORKS_API_KEY is not set",
+                "hint": "Configure FIREWORKS_API_KEY in environment to enable CV generation",
+            }, status=400)
+
+        # Resolve CV text (may raise Response)
+        cv_text, error_response = self._resolve_cv_text(request, cv_id, cv_text)
+        if error_response:
+            return error_response
+        text = (cv_text or "").strip()
+
+        def _format_suggestions(items):
+            lines = []
+            if isinstance(items, list):
+                for entry in items:
+                    if isinstance(entry, dict):
+                        title = entry.get("title") or "Suggestion"
+                        details = entry.get("details") or entry.get("description") or ""
+                        priority = entry.get("priority")
+                        priority_text = f" (priority: {priority})" if priority else ""
+                        lines.append(f"- {title}{priority_text}: {details}")
+                    else:
+                        lines.append(f"- {str(entry)}")
+            return "\n".join(lines).strip()
+
+        guidance_block = _format_suggestions(suggestions)
+        if not guidance_block:
+            guidance_block = (
+                "- Clarify summary with quantifiable achievements\n"
+                "- Ensure bullet points start with action verbs and include metrics\n"
+                "- Keep format ATS-friendly with consistent headings"
+            )
+
+        target_role = job_description or "General professional resume suitable for the candidate's profile."
+
+        system_prompt = (
+            "You are an elite ATS-optimized resume writer. "
+            "Rewrite the candidate's CV by applying the improvement guidance, keeping a professional tone, "
+            "clear section headings (SUMMARY, EXPERIENCE, SKILLS, EDUCATION, CERTIFICATIONS if available), "
+            "and metric-driven bullet points. "
+            "Return STRICT JSON with keys: rewritten_cv (string), summary (string), key_changes (array of strings). "
+            "Ensure the rewritten CV remains truthful to the provided information."
+        )
+
+        user_prompt = (
+            f"Original CV:\n{text}\n\n"
+            f"Improvement Guidance:\n{guidance_block}\n\n"
+            f"Target Role / Job Description:\n{target_role}\n\n"
+            f"Desired Tone: {tone}\n\n"
+            "Return the JSON object now."
+        )
+
+        try:
+            url = f"{FIREWORKS_BASE_URL}/chat/completions"
+            model_name = config("FIREWORKS_CHAT_MODEL", default="accounts/fireworks/models/llama-v3p3-70b-instruct")
+            headers = {
+                "Authorization": f"Bearer {FIREWORKS_API_KEY}",
+                "Content-Type": "application/json",
+            }
+            payload = {
+                "model": model_name,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                "temperature": 0.2,
+                "response_format": {"type": "json_object"},
+            }
+            r = requests.post(url, headers=headers, json=payload, timeout=90)
+            if not r.ok:
+                return Response({"detail": f"Fireworks error: {r.status_code}", "body": r.text}, status=400)
+            data_resp = r.json()
+            content = data_resp.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+        except Exception as e:
+            return Response({"detail": f"Model call failed: {e}"}, status=400)
+
+        try:
+            data = json.loads(content)
+        except Exception:
+            m = re.search(r"\{[\s\S]*\}", content)
+            if not m:
+                return Response({"detail": "Model returned non-JSON output", "raw": content}, status=400)
+            try:
+                data = json.loads(m.group(0))
+            except Exception:
+                return Response({"detail": "Unable to parse model output", "raw": content}, status=400)
+
+        rewritten_cv = (data.get("rewritten_cv") or "").strip()
+        summary = data.get("summary") or ""
+        key_changes = data.get("key_changes") or []
+
+        if not rewritten_cv:
+            return Response({"detail": "Model did not return rewritten_cv"}, status=400)
+
+        return Response({
+            "rewritten_cv": rewritten_cv,
+            "summary": summary,
+            "key_changes": key_changes,
+            "tone": tone,
+        }, status=200)
+
+
 # ==================== VOICE CHAT (CONVERSATIONAL HR) ====================
 
 class VoiceChatTurnView(APIView):
@@ -1070,7 +1914,10 @@ class VoiceChatTurnView(APIView):
         if audio_file and not user_text:
             openai_api_key = config("OPENAI_API_KEY", default=None)
             if not openai_api_key:
-                return Response({"detail": "OPENAI_API_KEY not configured for STT"}, status=400)
+                return Response({
+                    "detail": "OPENAI_API_KEY not configured for STT",
+                    "hint": "Set OPENAI_API_KEY environment variable. Voice chat requires OpenAI API key for Whisper speech-to-text."
+                }, status=400)
             try:
                 audio_file.seek(0)
                 whisper_url = "https://api.openai.com/v1/audio/transcriptions"
@@ -1081,7 +1928,20 @@ class VoiceChatTurnView(APIView):
                 if wr.ok:
                     user_text = wr.json().get("text", "")
                 else:
-                    return Response({"detail": f"Whisper error: {wr.status_code}", "body": wr.text}, status=400)
+                    # Parse OpenAI error response for better error message
+                    error_detail = f"Whisper error: {wr.status_code}"
+                    try:
+                        error_body = wr.json()
+                        if isinstance(error_body, dict):
+                            error_msg = error_body.get("error", {})
+                            if isinstance(error_msg, dict):
+                                error_detail = error_msg.get("message", error_detail)
+                                error_code = error_msg.get("code", "")
+                                if error_code == "invalid_api_key":
+                                    error_detail = f"Invalid OpenAI API key: {error_detail}. Please check your OPENAI_API_KEY environment variable."
+                    except Exception:
+                        error_detail = f"Whisper error: {wr.status_code} - {wr.text[:200]}"
+                    return Response({"detail": error_detail}, status=400)
             except Exception as e:
                 return Response({"detail": f"STT failed: {e}"}, status=400)
 
@@ -1115,7 +1975,7 @@ class VoiceChatTurnView(APIView):
 
         try:
             url = f"{FIREWORKS_BASE_URL}/chat/completions"
-            model_name = config("FIREWORKS_CHAT_MODEL", default="accounts/fireworks/models/llama-v3p1-70b-instruct")
+            model_name = config("FIREWORKS_CHAT_MODEL", default="accounts/fireworks/models/llama-v3p3-70b-instruct")
             headers = {"Authorization": f"Bearer {FIREWORKS_API_KEY}", "Content-Type": "application/json"}
             payload = {"model": model_name, "messages": messages, "temperature": 0.6}
             r = requests.post(url, headers=headers, json=payload, timeout=60)
@@ -1186,6 +2046,202 @@ class VoiceChatTurnView(APIView):
         }, status=200)
 
 
+# ==================== OPENAI CONVERSATIONAL INTERVIEW ====================
+
+class OpenAIConversationalInterviewView(APIView):
+    """Conversational interview using OpenAI Chat Completions, Whisper STT, and TTS (like ChatGPT voice chat)"""
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request):
+        """
+        One conversational turn for interview using OpenAI full stack.
+        
+        Accepts either user text or audio, returns assistant reply as text and OpenAI TTS audio (base64).
+        
+        Body (multipart/form-data or JSON):
+          - audio_file (optional): user's recorded audio
+          - text (optional): user's text (if no audio)
+          - history (optional JSON): [{role: "system"|"user"|"assistant", content: str}, ...]
+          - job_description (optional)
+          - cv_id (optional): use stored CV for context
+          - interview_type (optional): "hr" or "technical" (default: "hr")
+          - voice (optional): OpenAI TTS voice - alloy, echo, fable, onyx, nova, shimmer (default: "alloy")
+        """
+        openai_api_key = config("OPENAI_API_KEY", default=None)
+        if not openai_api_key:
+            return Response({
+                "detail": "OPENAI_API_KEY is not configured",
+                "hint": "Set OPENAI_API_KEY environment variable. This endpoint requires OpenAI API key for Chat Completions, Whisper STT, and TTS."
+            }, status=400)
+        
+        if OpenAI is None:
+            return Response({
+                "detail": "OpenAI Python library is not installed",
+                "hint": "Install with: pip install openai"
+            }, status=400)
+        
+        user_text = request.data.get("text", "")
+        job_description = request.data.get("job_description", "")
+        audio_file = request.FILES.get("audio_file")
+        interview_type = request.data.get("interview_type", "hr")  # "hr" or "technical"
+        voice = request.data.get("voice", "alloy")  # OpenAI TTS voices
+        
+        # Parse history if provided
+        history = []
+        try:
+            raw_history = request.data.get("history")
+            if raw_history:
+                if isinstance(raw_history, str):
+                    history = json.loads(raw_history)
+                elif isinstance(raw_history, list):
+                    history = raw_history
+        except Exception:
+            history = []
+        
+        # Get CV context if provided
+        cv_text = ""
+        cv_id = request.data.get("cv_id")
+        if cv_id:
+            try:
+                cv_obj = CV.objects.get(id=cv_id)
+                cv_text = cv_obj.parsed_text or ""
+            except CV.DoesNotExist:
+                pass
+        elif not cv_text:
+            # Get latest CV for user
+            try:
+                auth_user = getattr(request, "user", None)
+                auth_email = getattr(auth_user, "email", None)
+                if auth_email:
+                    sb_user = SbUser.objects.filter(email=auth_email).first()
+                    if sb_user:
+                        latest_cv = CV.objects.filter(user_id=sb_user.id).order_by('-created_at').first()
+                        if latest_cv:
+                            cv_text = latest_cv.parsed_text or ""
+            except Exception:
+                pass
+        
+        # STT: Convert audio to text using OpenAI Whisper
+        if audio_file and not user_text:
+            try:
+                audio_file.seek(0)
+                client = OpenAI(api_key=openai_api_key)
+                audio_file.seek(0)
+                transcript = client.audio.transcriptions.create(
+                    model="whisper-1",
+                    file=audio_file,
+                    response_format="verbose_json"
+                )
+                user_text = transcript.text
+            except Exception as e:
+                return Response({
+                    "detail": f"Speech-to-text failed: {str(e)}",
+                    "hint": "Check your audio file format and OpenAI API key"
+                }, status=400)
+        
+        if not user_text:
+            return Response({"detail": "Provide text or audio_file"}, status=400)
+        
+        # Build conversation context
+        if interview_type == "technical":
+            system_prompt = (
+                "You are a technical interviewer conducting a natural, conversational technical interview. "
+                "Ask technical questions based on the candidate's CV and responses. "
+                "Keep questions clear and appropriate for the candidate's experience level. "
+                "Engage in a natural conversation, asking follow-up questions based on their answers."
+            )
+        else:  # hr
+            system_prompt = (
+                "You are an HR interviewer holding a natural, conversational interview. "
+                "Ask behavioral and cultural fit questions. Keep questions short and conversational. "
+                "Respond based on the candidate's message and ask relevant follow-up questions."
+            )
+        
+        messages = [{"role": "system", "content": system_prompt}]
+        
+        # Add CV context if available
+        if cv_text:
+            messages.append({
+                "role": "system",
+                "content": f"Candidate CV context:\n{cv_text[:2000]}"
+            })
+        
+        # Add job description context
+        if job_description:
+            messages.append({
+                "role": "system",
+                "content": f"Target job description: {job_description[:1000]}"
+            })
+        
+        # Append conversation history (bounded to last 10 messages)
+        for m in (history or [])[-10:]:
+            r = m.get("role")
+            c = m.get("content")
+            if r in ("system", "user", "assistant") and isinstance(c, str):
+                messages.append({"role": r, "content": c})
+        
+        # Add current user message
+        messages.append({"role": "user", "content": user_text})
+        
+        # Chat Completions: Get AI response using OpenAI
+        try:
+            client = OpenAI(api_key=openai_api_key)
+            chat_model = config("OPENAI_CHAT_MODEL", default="gpt-4o-mini")
+            response = client.chat.completions.create(
+                model=chat_model,
+                messages=messages,
+                temperature=0.7,
+                max_tokens=500
+            )
+            assistant_text = response.choices[0].message.content.strip()
+        except Exception as e:
+            return Response({
+                "detail": f"Chat completion failed: {str(e)}",
+                "hint": "Check your OpenAI API key and model configuration"
+            }, status=400)
+        
+        # TTS: Convert assistant text to speech using OpenAI TTS
+        audio_b64 = None
+        audio_mime = None
+        audio_error = None
+        
+        if assistant_text:
+            try:
+                # Validate voice option
+                valid_voices = ["alloy", "echo", "fable", "onyx", "nova", "shimmer"]
+                if voice not in valid_voices:
+                    voice = "alloy"
+                
+                client = OpenAI(api_key=openai_api_key)
+                tts_response = client.audio.speech.create(
+                    model="tts-1",  # or "tts-1-hd" for higher quality
+                    voice=voice,
+                    input=assistant_text,
+                    response_format="mp3"
+                )
+                
+                # Read audio bytes
+                audio_bytes = b""
+                for chunk in tts_response.iter_bytes():
+                    audio_bytes += chunk
+                
+                audio_b64 = base64.b64encode(audio_bytes).decode('utf-8')
+                audio_mime = 'audio/mpeg'
+            except Exception as e:
+                audio_error = f"OpenAI TTS failed: {str(e)}"
+                # Note: TTS failure doesn't break the response - text is still returned
+        
+        return Response({
+            "assistant_text": assistant_text,
+            "assistant_audio_base64": audio_b64,
+            "assistant_audio_mime": audio_mime,
+            "assistant_audio_error": audio_error,
+            "user_text": user_text,
+            "interview_type": interview_type,
+            "voice": voice
+        }, status=200)
+
+
 class VoiceChatEvaluateView(APIView):
     permission_classes = [permissions.IsAuthenticated]
 
@@ -1237,7 +2293,7 @@ class VoiceChatEvaluateView(APIView):
             )
 
             url = f"{FIREWORKS_BASE_URL}/chat/completions"
-            model_name = config("FIREWORKS_CHAT_MODEL", default="accounts/fireworks/models/llama-v3p1-70b-instruct")
+            model_name = config("FIREWORKS_CHAT_MODEL", default="accounts/fireworks/models/llama-v3p3-70b-instruct")
             headers = {"Authorization": f"Bearer {FIREWORKS_API_KEY}", "Content-Type": "application/json"}
             payload = {
                 "model": model_name,
@@ -1320,7 +2376,10 @@ class TechVoiceChatTurnView(APIView):
         if audio_file and not user_text:
             openai_api_key = config("OPENAI_API_KEY", default=None)
             if not openai_api_key:
-                return Response({"detail": "OPENAI_API_KEY is not configured"}, status=400)
+                return Response({
+                    "detail": "OPENAI_API_KEY is not configured",
+                    "hint": "Set OPENAI_API_KEY environment variable. Voice chat requires OpenAI API key for Whisper speech-to-text."
+                }, status=400)
             try:
                 audio_file.seek(0)
                 whisper_url = "https://api.openai.com/v1/audio/transcriptions"
@@ -1331,7 +2390,20 @@ class TechVoiceChatTurnView(APIView):
                 if wr.ok:
                     user_text = wr.json().get("text", "")
                 else:
-                    return Response({"detail": f"Whisper error: {wr.status_code}", "body": wr.text}, status=400)
+                    # Parse OpenAI error response for better error message
+                    error_detail = f"Whisper error: {wr.status_code}"
+                    try:
+                        error_body = wr.json()
+                        if isinstance(error_body, dict):
+                            error_msg = error_body.get("error", {})
+                            if isinstance(error_msg, dict):
+                                error_detail = error_msg.get("message", error_detail)
+                                error_code = error_msg.get("code", "")
+                                if error_code == "invalid_api_key":
+                                    error_detail = f"Invalid OpenAI API key: {error_detail}. Please check your OPENAI_API_KEY environment variable."
+                    except Exception:
+                        error_detail = f"Whisper error: {wr.status_code} - {wr.text[:200]}"
+                    return Response({"detail": error_detail}, status=400)
             except Exception as e:
                 return Response({"detail": f"STT failed: {e}"}, status=400)
 
@@ -1379,7 +2451,7 @@ class TechVoiceChatTurnView(APIView):
 
             try:
                 url = f"{FIREWORKS_BASE_URL}/chat/completions"
-                model_name = config("FIREWORKS_CHAT_MODEL", default="accounts/fireworks/models/llama-v3p1-70b-instruct")
+                model_name = config("FIREWORKS_CHAT_MODEL", default="accounts/fireworks/models/llama-v3p3-70b-instruct")
                 headers = {"Authorization": f"Bearer {FIREWORKS_API_KEY}", "Content-Type": "application/json"}
                 payload = {"model": model_name, "messages": messages, "temperature": 0.5}
                 r = requests.post(url, headers=headers, json=payload, timeout=60)
@@ -1462,6 +2534,7 @@ class TechVoiceChatEvaluateView(APIView):
             pass
 
         transcript_lines = []
+        candidate_responses = []
         for m in history[-50:]:
             role = m.get("role")
             content = (m.get("content") or "").strip()
@@ -1469,7 +2542,19 @@ class TechVoiceChatEvaluateView(APIView):
                 continue
             who = "Candidate" if role == "user" else "Interviewer"
             transcript_lines.append(f"{who}: {content}")
+            if role == "user":  # Count candidate responses
+                candidate_responses.append(content)
         transcript = "\n".join(transcript_lines)
+
+        # If no candidate responses or transcript is empty/too short, return 0 score
+        if not candidate_responses or len(candidate_responses) == 0 or not transcript.strip() or len(transcript.strip()) < 10:
+            return Response({
+                "overall_score": 0,
+                "strengths": [],
+                "weaknesses": ["No answers provided for evaluation"],
+                "improvement_tips": ["Please provide answers to the interview questions"],
+                "summary": "Cannot evaluate: No candidate responses found in the interview transcript."
+            }, status=200)
 
         if not FIREWORKS_API_KEY:
             score = max(50, min(90, 65 + len(transcript) // 700))
@@ -1493,7 +2578,7 @@ class TechVoiceChatEvaluateView(APIView):
         user_prompt += f"Interview Transcript:\n{transcript}\n\nProvide the JSON now."
         try:
             url = f"{FIREWORKS_BASE_URL}/chat/completions"
-            model_name = config("FIREWORKS_CHAT_MODEL", default="accounts/fireworks/models/llama-v3p1-70b-instruct")
+            model_name = config("FIREWORKS_CHAT_MODEL", default="accounts/fireworks/models/llama-v3p3-70b-instruct")
             headers = {"Authorization": f"Bearer {FIREWORKS_API_KEY}", "Content-Type": "application/json"}
             payload = {"model": model_name, "messages": [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}], "temperature": 0.4, "response_format": {"type": "json_object"}}
             r = requests.post(url, headers=headers, json=payload, timeout=60)
@@ -1508,8 +2593,11 @@ class TechVoiceChatEvaluateView(APIView):
                     m = re.search(r"\{[\s\S]*\}", s)
                     return json.loads(m.group(0)) if m else None
             data = _parse_json(content) or {}
+            # Calculate score from AI response
+            calculated_score = max(0, min(100, int(float(data.get("overall_score", 0))))) if str(data.get("overall_score", "")).strip() != "" else 0
+            
             result = {
-                "overall_score": max(0, min(100, int(float(data.get("overall_score", 0))))) if str(data.get("overall_score", "")).strip() != "" else 0,
+                "overall_score": calculated_score,
                 "strengths": data.get("strengths") or [],
                 "weaknesses": data.get("weaknesses") or [],
                 "improvement_tips": data.get("improvement_tips") or [],
@@ -1602,7 +2690,7 @@ class DashboardView(APIView):
                 else:
                     try:
                         url = f"{FIREWORKS_BASE_URL}/chat/completions"
-                        model_name = config("FIREWORKS_CHAT_MODEL", default="accounts/fireworks/models/llama-v3p1-70b-instruct")
+                        model_name = config("FIREWORKS_CHAT_MODEL", default="accounts/fireworks/models/llama-v3p3-70b-instruct")
                         headers = {
                             "Authorization": f"Bearer {FIREWORKS_API_KEY}",
                             "Content-Type": "application/json",
@@ -1715,7 +2803,7 @@ class CareerAdvisorView(APIView):
 
         try:
             url = f"{FIREWORKS_BASE_URL}/chat/completions"
-            model_name = config("FIREWORKS_CHAT_MODEL", default="accounts/fireworks/models/llama-v3p1-70b-instruct")
+            model_name = config("FIREWORKS_CHAT_MODEL", default="accounts/fireworks/models/llama-v3p3-70b-instruct")
             headers = {
                 "Authorization": f"Bearer {FIREWORKS_API_KEY}",
                 "Content-Type": "application/json",
@@ -1757,16 +2845,125 @@ class CareerAdvisorView(APIView):
             }, status=400)
 
         # Normalize response defensively
+        skills_gaps = data.get("skills_gaps") or []
+        
+        # Search for MaharaTech courses for each skill gap
+        skill_courses = []
+        for skill in skills_gaps:
+            courses = search_maharatech_courses(skill, max_results=3)
+            if courses:  # Only add if courses are found
+                skill_courses.append({
+                    "skill": skill,
+                    "courses": courses
+                })
+        
         result = {
             "current_role_assessment": data.get("current_role_assessment", ""),
             "career_paths": data.get("career_paths") or [],
-            "skills_gaps": data.get("skills_gaps") or [],
+            "skills_gaps": skills_gaps,
+            "skill_courses": skill_courses,  # New field with course suggestions
             "market_demand": data.get("market_demand") or [],
             "recommendations": data.get("recommendations") or [],
             "next_steps": data.get("next_steps") or [],
             "analyzed_chars": len(text),
         }
         return Response(result, status=200)
+
+
+class MultiAgentCareerView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request):
+        """Multi-Agent Career Development System: Comprehensive career analysis using specialized agents.
+        
+        Accepts:
+          - cv_id (optional): use a stored CV
+          - cv_text (optional): raw CV text
+          - target_role (optional): specific role to analyze for
+          - none: use the latest CV of the authenticated user
+        """
+        from .multi_agent_career import MultiAgentCareerCoordinator
+        
+        cv_id = request.data.get("cv_id")
+        cv_text = request.data.get("cv_text")
+        target_role = request.data.get("target_role")
+
+        # Resolve CV text (same logic as CareerAdvisorView)
+        if cv_id and not cv_text:
+            try:
+                cv_obj = CV.objects.get(id=cv_id)
+                cv_text = cv_obj.parsed_text or ""
+            except CV.DoesNotExist:
+                return Response({"detail": "cv_id not found"}, status=404)
+
+        if not cv_id and not cv_text:
+            auth_user = getattr(request, "user", None)
+            auth_email = getattr(auth_user, "email", None)
+            sb_user = None
+            if auth_email:
+                sb_user = SbUser.objects.filter(email=auth_email).first()
+            if not sb_user:
+                return Response({
+                    "detail": "Associated Supabase user not found for authenticated account",
+                    "hint": "Ensure a matching SbUser exists with the same email as the logged-in user",
+                }, status=404)
+            latest_cv = CV.objects.filter(user_id=sb_user.id).order_by('-created_at').first()
+            if not latest_cv:
+                return Response({
+                    "detail": "No uploaded CV found for the authenticated user",
+                    "hint": "Upload a CV first using /api/rag/cv-upload/",
+                }, status=404)
+            cv_text = latest_cv.parsed_text or ""
+
+        if not cv_text:
+            return Response({"detail": "cv_text is empty"}, status=400)
+
+        if not FIREWORKS_API_KEY:
+            return Response({
+                "detail": "FIREWORKS_API_KEY is not set",
+                "hint": "Configure FIREWORKS_API_KEY in environment",
+            }, status=400)
+
+        try:
+            # Initialize coordinator and run multi-agent analysis
+            coordinator = MultiAgentCareerCoordinator()
+            result = coordinator.analyze_career(cv_text.strip(), target_role=target_role)
+            
+            # Check if there was an error in the result
+            if "error" in result:
+                import logging
+                logger = logging.getLogger(__name__)
+                logger.error(f"Multi-agent career analysis error: {result.get('error')}")
+                # Still return the result with partial data if available
+                if not result.get("cv_analysis"):
+                    return Response({
+                        "detail": f"Multi-agent analysis failed: {result.get('error', 'Unknown error')}",
+                        "error": result.get("error")
+                    }, status=500)
+            
+            # Add metadata
+            result["analyzed_chars"] = len(cv_text)
+            result["target_role"] = target_role
+            result["timestamp"] = timezone.now().isoformat()
+            
+            return Response(result, status=200)
+            
+        except ImportError as e:
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.error(f"Import error in multi-agent career: {e}", exc_info=True)
+            return Response({
+                "detail": f"Failed to import multi-agent module: {str(e)}",
+                "hint": "Ensure all dependencies are installed"
+            }, status=500)
+        except Exception as e:
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.error(f"Multi-agent career analysis failed: {e}", exc_info=True)
+            return Response({
+                "detail": f"Multi-agent analysis failed: {str(e)}",
+                "error_type": type(e).__name__
+            }, status=500)
 
 
 class InterviewQuestionsView(APIView):
@@ -1843,7 +3040,7 @@ class InterviewQuestionsView(APIView):
 
         try:
             url = f"{FIREWORKS_BASE_URL}/chat/completions"
-            model_name = config("FIREWORKS_CHAT_MODEL", default="accounts/fireworks/models/llama-v3p1-70b-instruct")
+            model_name = config("FIREWORKS_CHAT_MODEL", default="accounts/fireworks/models/llama-v3p3-70b-instruct")
             headers = {
                 "Authorization": f"Bearer {FIREWORKS_API_KEY}",
                 "Content-Type": "application/json",
@@ -2006,7 +3203,7 @@ class InterviewPracticeView(APIView):
 
         try:
             url = f"{FIREWORKS_BASE_URL}/chat/completions"
-            model_name = config("FIREWORKS_CHAT_MODEL", default="accounts/fireworks/models/llama-v3p1-70b-instruct")
+            model_name = config("FIREWORKS_CHAT_MODEL", default="accounts/fireworks/models/llama-v3p3-70b-instruct")
             headers = {
                 "Authorization": f"Bearer {FIREWORKS_API_KEY}",
                 "Content-Type": "application/json",
@@ -2146,7 +3343,7 @@ class InterviewAnswerEvaluationView(APIView):
 
         try:
             url = f"{FIREWORKS_BASE_URL}/chat/completions"
-            model_name = config("FIREWORKS_CHAT_MODEL", default="accounts/fireworks/models/llama-v3p1-70b-instruct")
+            model_name = config("FIREWORKS_CHAT_MODEL", default="accounts/fireworks/models/llama-v3p3-70b-instruct")
             headers = {
                 "Authorization": f"Bearer {FIREWORKS_API_KEY}",
                 "Content-Type": "application/json",
@@ -2400,7 +3597,7 @@ class InterviewBatchSubmissionView(APIView):
 
         try:
             url = f"{FIREWORKS_BASE_URL}/chat/completions"
-            model_name = config("FIREWORKS_CHAT_MODEL", default="accounts/fireworks/models/llama-v3p1-70b-instruct")
+            model_name = config("FIREWORKS_CHAT_MODEL", default="accounts/fireworks/models/llama-v3p3-70b-instruct")
             headers = {
                 "Authorization": f"Bearer {FIREWORKS_API_KEY}",
                 "Content-Type": "application/json",
@@ -2734,7 +3931,7 @@ class AudioInterviewQuestionsView(APIView):
 
         try:
             url = f"{FIREWORKS_BASE_URL}/chat/completions"
-            model_name = config("FIREWORKS_CHAT_MODEL", default="accounts/fireworks/models/llama-v3p1-70b-instruct")
+            model_name = config("FIREWORKS_CHAT_MODEL", default="accounts/fireworks/models/llama-v3p3-70b-instruct")
             headers = {
                 "Authorization": f"Bearer {FIREWORKS_API_KEY}",
                 "Content-Type": "application/json",
@@ -3162,7 +4359,7 @@ class AudioInterviewBatchSubmissionView(APIView):
 
         try:
             url = f"{FIREWORKS_BASE_URL}/chat/completions"
-            model_name = config("FIREWORKS_CHAT_MODEL", default="accounts/fireworks/models/llama-v3p1-70b-instruct")
+            model_name = config("FIREWORKS_CHAT_MODEL", default="accounts/fireworks/models/llama-v3p3-70b-instruct")
             headers = {
                 "Authorization": f"Bearer {FIREWORKS_API_KEY}",
                 "Content-Type": "application/json",

@@ -3,6 +3,8 @@ from typing import List, Tuple
 from decouple import config
 from django.db import connection
 
+
+
 try:
     from openai import OpenAI
 except Exception:
@@ -156,7 +158,7 @@ def embed_text(text: str) -> List[float]:
     return embed_text_openai(text)
 
 
-def search_similar_jobs(embedding: List[float], top_n: int = 10, similarity_threshold: float = 0.5) -> List[Tuple]:
+def search_similar_jobs(embedding: List[float], top_n: int = 10, similarity_threshold: float = 0.6) -> List[Tuple]:
     """
     Search for similar jobs using cosine similarity with pgvector.
     """
@@ -312,3 +314,34 @@ def generate_answer(query: str, jobs: List[Tuple]) -> str:
     ]
     resp = client.chat.completions.create(model=CHAT_MODEL, messages=messages, temperature=0.2)
     return resp.choices[0].message.content.strip()
+
+
+def generate_text_fireworks(prompt, system_prompt="You are a helpful AI assistant."):
+    if not FIREWORKS_API_KEY:
+        return "Error: Fireworks API key not configured."
+    
+    # Use a default model if not configured specifically for chat
+    model = "accounts/fireworks/models/llama-v3p1-70b-instruct"
+    
+    url = f"{FIREWORKS_BASE_URL}/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {FIREWORKS_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": prompt}
+        ],
+        "temperature": 0.7,
+        "max_tokens": 1024,
+    }
+    
+    try:
+        response = requests.post(url, json=payload, headers=headers, timeout=30)
+        response.raise_for_status()
+        data = response.json()
+        return data["choices"][0]["message"]["content"]
+    except Exception as e:
+        return f"Error generating text: {str(e)}"
